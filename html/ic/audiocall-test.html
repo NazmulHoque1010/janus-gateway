@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AudioCall Test</title>
+<!-- webrtc-adapter is required by janus.js -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/webrtc-adapter/8.2.3/adapter.min.js"></script>
+<script src="../demos/janus.js"></script>
+<style>
+  body { font-family: sans-serif; max-width: 720px; margin: 16px auto; padding: 0 16px; }
+  fieldset { margin-bottom: 12px; }
+  label { display: inline-block; min-width: 110px; }
+  input { padding: 4px; margin: 2px 0; }
+  button { padding: 6px 12px; margin: 4px 4px 4px 0; }
+  #log { background: #111; color: #9f9; padding: 8px; height: 280px; overflow-y: auto;
+         font: 12px monospace; white-space: pre-wrap; }
+  #stats { font: 13px monospace; }
+</style>
+</head>
+<body>
+<h2>AudioCall plugin test</h2>
+
+<fieldset>
+  <legend>1. Connect</legend>
+  <label>Janus server</label>
+  <input id="server" size="40"><br>
+  <label>Username</label>
+  <input id="username" value="1000">
+  <button id="btnConnect">Connect &amp; register</button>
+</fieldset>
+
+<fieldset>
+  <legend>2. Call</legend>
+  <label>Call user</label>
+  <input id="peer" value="1001">
+  <button id="btnCall" disabled>Audio call</button>
+  <button id="btnVideo" disabled title="Should be rejected by the plugin">Try video call (should fail)</button>
+  <button id="btnHangup" disabled>Hang up</button>
+  <div id="stats">Audio received: -</div>
+  <audio id="remoteAudio" autoplay></audio>
+</fieldset>
+
+<div id="log"></div>
+
+<script>
+const PLUGIN = "janus.plugin.audiocall";
+const $ = (id) => document.getElementById(id);
+$("server").value = "ws://" + (location.hostname || "localhost") + ":8188";
+
+let janus = null, handle = null, statsTimer = null;
+
+function log(text) {
+  const line = new Date().toLocaleTimeString() + "  " + text + "\n";
+  $("log").textContent += line;
+  $("log").scrollTop = $("log").scrollHeight;
+  console.log(text);
+}
+
+function setInCall(inCall) {
+  $("btnCall").disabled = inCall;
+  $("btnVideo").disabled = inCall;
+  $("btnHangup").disabled = !inCall;
+}
+
+function startStats() {
+  stopStats();
+  statsTimer = setInterval(async () => {
+    const pc = handle && handle.webrtcStuff && handle.webrtcStuff.pc;
+    if (!pc) return;
+    const report = await pc.getStats();
+    report.forEach((s) => {
+      if (s.type === "inbound-rtp" && s.kind === "audio") {
+        $("stats").textContent = "Audio received: " + s.packetsReceived +
+          " packets, " + s.bytesReceived + " bytes";
+      }
+    });
+  }, 1000);
+}
+
+function stopStats() {
+  if (statsTimer) clearInterval(statsTimer);
+  statsTimer = null;
+}
+
+function startCall(withVideo) {
+  const peer = $("peer").value.trim();
+  const tracks = [{ type: "audio", capture: true, recv: true }];
+  if (withVideo) tracks.push({ type: "video", capture: true, recv: true });
+  log((withVideo ? "Trying VIDEO call to " : "Calling ") + peer + " ...");
+  handle.createOffer({
+    tracks: tracks,
+    success: (jsep) => {
+      handle.send({ message: { request: "call", username: peer }, jsep: jsep });
+      setInCall(true);
+    },
+    error: (err) => log("createOffer error: " + JSON.stringify(err)),
+  });
+}
+
+$("btnConnect").onclick = () => {
+  $("btnConnect").disabled = true;
+  Janus.init({
+    debug: false,
+    callback: () => {
+      janus = new Janus({
+        server: $("server").value.trim(),
+        success: () => {
+          log("Connected to Janus");
+          janus.attach({
+            plugin: PLUGIN,
+            success: (h) => {
+              handle = h;
+              log("Attached to " + PLUGIN + " (handle " + h.getId() + ")");
+              handle.send({ message: { request: "register", username: $("username").value.trim() } });
+            },
+            error: (err) => log("Attach error: " + err),
+            onmessage: (msg, jsep) => {
+              log("<- " + JSON.stringify(msg));
+              if (msg.error) {
+                setInCall(false);
+                return;
+              }
+              const result = msg.result || {};
+              const event = result.event;
+              if (event === "registered") {
+                log("Registered as " + result.username);
+                $("btnCall").disabled = false;
+                $("btnVideo").disabled = false;
+              } else if (event === "incomingcall") {
+                log("Incoming call from " + result.username + " - answering (audio only)");
+                handle.createAnswer({
+                  jsep: jsep,
+                  tracks: [{ type: "audio", capture: true, recv: true }],
+                  success: (answer) => {
+                    handle.send({ message: { request: "accept" }, jsep: answer });
+                    setInCall(true);
+                  },
+                  error: (err) => log("createAnswer error: " + JSON.stringify(err)),
+                });
+              } else if (event === "accepted") {
+                if (jsep) handle.handleRemoteJsep({ jsep: jsep });
+                log("Call accepted");
+              } else if (event === "hangup") {
+                log("Hangup: " + (result.reason || ""));
+                handle.hangup();
+                setInCall(false);
+              }
+            },
+            webrtcState: (on) => {
+              log("WebRTC PeerConnection is " + (on ? "UP" : "DOWN"));
+              if (on) startStats(); else stopStats();
+            },
+            onremotetrack: (track, mid, on) => {
+              log("Remote " + track.kind + " track " + (on ? "added" : "removed"));
+              if (on && track.kind === "audio") {
+                $("remoteAudio").srcObject = new MediaStream([track]);
+              }
+            },
+            oncleanup: () => {
+              log("PeerConnection cleaned up");
+              stopStats();
+              setInCall(false);
+            },
+          });
+        },
+        error: (err) => {
+          log("Janus error: " + err);
+          $("btnConnect").disabled = false;
+        },
+        destroyed: () => log("Janus session destroyed"),
+      });
+    },
+  });
+};
+
+$("btnCall").onclick = () => startCall(false);
+$("btnVideo").onclick = () => startCall(true);
+$("btnHangup").onclick = () => {
+  handle.send({ message: { request: "hangup" } });
+  handle.hangup();
+  setInCall(false);
+};
+</script>
+</body>
+</html>

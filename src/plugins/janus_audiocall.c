@@ -271,7 +271,7 @@
 /* Plugin information */
 #define JANUS_AUDIOCALL_VERSION			6
 #define JANUS_AUDIOCALL_VERSION_STRING	"0.0.6"
-#define JANUS_AUDIOCALL_DESCRIPTION		"This is a simple audio call plugin for Janus, allowing two WebRTC peers to call each other through a server."
+#define JANUS_AUDIOCALL_DESCRIPTION		"Audio-only calls between two WebRTC peers (IC project, based on the Janus VideoCall plugin)."
 #define JANUS_AUDIOCALL_NAME			"JANUS AudioCall plugin"
 #define JANUS_AUDIOCALL_AUTHOR			"Meetecho s.r.l."
 #define JANUS_AUDIOCALL_PACKAGE			"janus.plugin.audiocall"
@@ -461,6 +461,7 @@ static void janus_audiocall_message_free(janus_audiocall_message *msg) {
 #define JANUS_AUDIOCALL_ERROR_NO_CALL				481
 #define JANUS_AUDIOCALL_ERROR_MISSING_SDP			482
 #define JANUS_AUDIOCALL_ERROR_INVALID_SDP			483
+#define JANUS_AUDIOCALL_ERROR_AUDIO_ONLY			484
 
 
 /* Plugin implementation */
@@ -768,6 +769,9 @@ void janus_audiocall_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp
 		}
 		if(g_atomic_int_get(&session->destroyed) || g_atomic_int_get(&peer->destroyed))
 			return;
+		/* IC: audio-only plugin, never relay video packets */
+		if(packet->video)
+			return;
 		gboolean video = packet->video;
 		char *buf = packet->buffer;
 		uint16_t len = packet->length;
@@ -873,6 +877,8 @@ void janus_audiocall_incoming_rtcp(janus_plugin_session *handle, janus_plugin_rt
 void janus_audiocall_incoming_data(janus_plugin_session *handle, janus_plugin_data *packet) {
 	if(handle == NULL || g_atomic_int_get(&handle->stopped) || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return;
+	/* IC: audio-only plugin, data channels are not relayed */
+	return;
 	if(gateway) {
 		janus_audiocall_session *session = (janus_audiocall_session *)handle->plugin_handle;
 		if(!session) {
@@ -1057,6 +1063,39 @@ static void janus_audiocall_hangup_media_internal(janus_plugin_session *handle) 
 	g_atomic_int_set(&session->hangingup, 0);
 }
 
+/* IC: AudioCall only allows audio. Returns TRUE if the SDP has an audio
+ * m-line and no active video or data m-line; otherwise writes why in reason. */
+static gboolean janus_audiocall_sdp_is_audio_only(const char *sdp_text, char *reason, size_t reason_len) {
+	char error_str[512];
+	janus_sdp *sdp = janus_sdp_parse(sdp_text, error_str, sizeof(error_str));
+	if(sdp == NULL) {
+		g_snprintf(reason, reason_len, "Error parsing SDP: %s", error_str);
+		return FALSE;
+	}
+	gboolean has_audio = FALSE, has_other = FALSE;
+	GList *temp = sdp->m_lines;
+	while(temp) {
+		janus_sdp_mline *m = (janus_sdp_mline *)temp->data;
+		if(m->port > 0) {
+			if(m->type == JANUS_SDP_AUDIO)
+				has_audio = TRUE;
+			else if(m->direction != JANUS_SDP_INACTIVE)
+				has_other = TRUE;
+		}
+		temp = temp->next;
+	}
+	janus_sdp_destroy(sdp);
+	if(has_other) {
+		g_snprintf(reason, reason_len, "AudioCall is audio-only: video and data are not allowed");
+		return FALSE;
+	}
+	if(!has_audio) {
+		g_snprintf(reason, reason_len, "AudioCall needs an audio stream in the SDP");
+		return FALSE;
+	}
+	return TRUE;
+}
+
 /* Thread to handle incoming messages */
 static void *janus_audiocall_handler(void *data) {
 	JANUS_LOG(LOG_VERB, "Joining AudioCall handler thread\n");
@@ -1108,6 +1147,20 @@ static void *janus_audiocall_handler(void *data) {
 			goto error;
 		const char *msg_sdp_type = json_string_value(json_object_get(msg->jsep, "type"));
 		const char *msg_sdp = json_string_value(json_object_get(msg->jsep, "sdp"));
+		/* IC: reject any offer/answer that is not audio-only */
+		if(msg_sdp != NULL) {
+			char sdp_reason[256];
+			if(!janus_audiocall_sdp_is_audio_only(msg_sdp, sdp_reason, sizeof(sdp_reason))) {
+				JANUS_LOG(LOG_WARN, "[AudioCall] Rejecting SDP from %s: %s\n",
+					session->username ? session->username : "(not registered)", sdp_reason);
+				error_code = JANUS_AUDIOCALL_ERROR_AUDIO_ONLY;
+				g_snprintf(error_cause, 512, "%s", sdp_reason);
+				/* Not in a call yet: drop the PeerConnection Janus set up for this attempt */
+				if(session->peer == NULL)
+					gateway->close_pc(session->handle);
+				goto error;
+			}
+		}
 		json_t *msg_e2ee = json_object_get(msg->jsep, "e2ee");
 		if(json_is_true(msg_e2ee))
 			session->e2ee = TRUE;
