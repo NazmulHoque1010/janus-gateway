@@ -184,6 +184,8 @@ AC_ARG_ENABLE([all-plugins],
                      [enable_plugin_textroom=no])
                AS_IF([test "x$enable_plugin_videocall" != "xyes"],
                      [enable_plugin_videocall=no])
+               AS_IF([test "x$enable_plugin_audiocall" != "xyes"],
+                     [enable_plugin_audiocall=no])
                AS_IF([test "x$enable_plugin_videoroom" != "xyes"],
                      [enable_plugin_videoroom=no])
               ],
@@ -761,6 +763,13 @@ AC_ARG_ENABLE([plugin-videocall],
                      [enable_plugin_videocall=no])],
               [enable_plugin_videocall=yes])
 
+AC_ARG_ENABLE([plugin-audiocall],
+              [AS_HELP_STRING([--disable-plugin-audiocall],
+                              [Disable audiocall plugin])],
+              [AS_IF([test "x$enable_plugin_audiocall" != "xyes"],
+                     [enable_plugin_audiocall=no])],
+              [enable_plugin_audiocall=yes])
+
 AC_ARG_ENABLE([plugin-videoroom],
               [AS_HELP_STRING([--disable-plugin-videoroom],
                               [Disable videoroom plugin])],
@@ -865,6 +874,7 @@ AM_CONDITIONAL([ENABLE_PLUGIN_SIP], [test "x$enable_plugin_sip" = "xyes"])
 AM_CONDITIONAL([ENABLE_PLUGIN_NOSIP], [test "x$enable_plugin_nosip" = "xyes"])
 AM_CONDITIONAL([ENABLE_PLUGIN_STREAMING], [test "x$enable_plugin_streaming" = "xyes"])
 AM_CONDITIONAL([ENABLE_PLUGIN_VIDEOCALL], [test "x$enable_plugin_videocall" = "xyes"])
+AM_CONDITIONAL([ENABLE_PLUGIN_AUDIOCALL], [test "x$enable_plugin_audiocall" = "xyes"])
 AM_CONDITIONAL([ENABLE_PLUGIN_VIDEOROOM], [test "x$enable_plugin_videoroom" = "xyes"])
 AM_CONDITIONAL([ENABLE_PLUGIN_TEXTROOM], [test "x$enable_plugin_textroom" = "xyes"])
 
@@ -1059,6 +1069,9 @@ AM_COND_IF([ENABLE_PLUGIN_STREAMING],
 AM_COND_IF([ENABLE_PLUGIN_VIDEOCALL],
 	[echo "    Video Call:            yes"],
 	[echo "    Video Call:            no"])
+AM_COND_IF([ENABLE_PLUGIN_AUDIOCALL],
+	[echo "    Audio Call (IC):       yes"],
+	[echo "    Audio Call (IC):       no"])
 AM_COND_IF([ENABLE_PLUGIN_SIP],
 	[echo "    SIP Gateway:           yes"],
 	[echo "    SIP Gateway:           no"])
