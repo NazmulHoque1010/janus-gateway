@@ -37,6 +37,9 @@
   <button id="btnCall" disabled>Audio call</button>
   <button id="btnVideo" disabled title="Should be rejected by the plugin">Try video call (should fail)</button>
   <button id="btnHangup" disabled>Hang up</button>
+  <br>
+  <button id="btnList" disabled>List users (both servers)</button>
+  <button id="btnLocate" disabled>Locate "Call user"</button>
   <div id="stats">Audio received: -</div>
   <audio id="remoteAudio" autoplay></audio>
 </fieldset>
@@ -121,12 +124,24 @@ $("btnConnect").onclick = () => {
                 setInCall(false);
                 return;
               }
+              const r = msg.result || {};
+              if (r.list !== undefined) {
+                log("Users on this server (" + (r.server || "?") + "): " + JSON.stringify(r.list));
+                if (r.peer_online === undefined) log("Peer link: not configured");
+                else if (r.peer_online) log("Users on peer server (" + (r.peer_server || "?") + "): " + JSON.stringify(r.peer_list));
+                else log("Peer server: NOT reachable");
+                return;
+              }
               const result = msg.result || {};
               const event = result.event;
-              if (event === "registered") {
+              if (event === "located") {
+                log("User " + result.username + " is registered: " + result.where);
+              } else if (event === "registered") {
                 log("Registered as " + result.username);
                 $("btnCall").disabled = false;
                 $("btnVideo").disabled = false;
+                $("btnList").disabled = false;
+                $("btnLocate").disabled = false;
               } else if (event === "incomingcall") {
                 log("Incoming call from " + result.username + " - answering (audio only)");
                 handle.createAnswer({
@@ -175,6 +190,8 @@ $("btnConnect").onclick = () => {
 };
 
 $("btnCall").onclick = () => startCall(false);
+$("btnList").onclick = () => handle.send({ message: { request: "list" } });
+$("btnLocate").onclick = () => handle.send({ message: { request: "locate", username: $("peer").value.trim() } });
 $("btnVideo").onclick = () => startCall(true);
 $("btnHangup").onclick = () => {
   handle.send({ message: { request: "hangup" } });
