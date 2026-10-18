@@ -279,7 +279,17 @@
 /* Plugin information */
 #define JANUS_AUDIOCALL_VERSION			6
 #define JANUS_AUDIOCALL_VERSION_STRING	"0.2.0-ic"
+/* IC: this file builds two plugins. Normally it is the audio-only AudioCall
+ * plugin; the build also generates janus_customvideocall.c from it (all names
+ * renamed) and compiles that with -DIC_VIDEO to get the CustomVideoCall plugin,
+ * which allows video. Both share the peer link code (each on its own port). */
+#ifdef IC_VIDEO
+#define JANUS_AUDIOCALL_DESCRIPTION		"Audio and video calls between two WebRTC peers, on this or a peer Janus server (IC project)."
+#define JANUS_AUDIOCALL_DEFAULT_LINK_PORT	7089
+#else
 #define JANUS_AUDIOCALL_DESCRIPTION		"Audio-only calls between two WebRTC peers (IC project, based on the Janus VideoCall plugin)."
+#define JANUS_AUDIOCALL_DEFAULT_LINK_PORT	7088
+#endif
 #define JANUS_AUDIOCALL_NAME			"JANUS AudioCall plugin"
 #define JANUS_AUDIOCALL_AUTHOR			"Meetecho s.r.l."
 #define JANUS_AUDIOCALL_PACKAGE			"janus.plugin.audiocall"
@@ -406,6 +416,7 @@ typedef struct janus_audiocall_session {
 	gboolean remote_call;		/* TRUE if our call partner is on the peer server */
 	guint32 call_id;			/* Identifies the call on the peer link */
 	char *remote_username;		/* Username of our partner on the peer server */
+	gboolean remote_video_seen;	/* Got the first video packet from the peer (keyframe requested) */
 	janus_mutex mutex;
 	janus_refcount ref;
 } janus_audiocall_session;
@@ -492,7 +503,7 @@ static void janus_audiocall_message_free(janus_audiocall_message *msg) {
 static gboolean link_enabled = FALSE;
 static char *link_server_name = NULL;
 static char *link_peer_host = NULL;
-static uint16_t link_local_port = 7088, link_peer_port = 7088;
+static uint16_t link_local_port = JANUS_AUDIOCALL_DEFAULT_LINK_PORT, link_peer_port = JANUS_AUDIOCALL_DEFAULT_LINK_PORT;
 static int link_fd = -1;
 static struct sockaddr_in link_peer_addr;
 static GThread *link_thread = NULL;
@@ -509,7 +520,7 @@ static GHashTable *link_replies = NULL;	/* tid -> reply (json_t *), protected by
 /* IC: cross-server calls in progress on THIS server: call_id -> local session (the table holds a reference) */
 static GHashTable *remote_calls = NULL;
 static janus_mutex remote_calls_mutex = JANUS_MUTEX_INITIALIZER;
-static gboolean janus_audiocall_sdp_is_audio_only(const char *sdp_text, char *reason, size_t reason_len);
+static gboolean janus_audiocall_sdp_allowed(const char *sdp_text, char *reason, size_t reason_len);
 #define JANUS_AUDIOCALL_LINK_PING_EVERY		(5 * G_TIME_SPAN_SECOND)
 #define JANUS_AUDIOCALL_LINK_DEAD_AFTER		(15 * G_TIME_SPAN_SECOND)
 
@@ -609,6 +620,7 @@ static void janus_audiocall_remote_add(janus_audiocall_session *session, guint32
 	janus_mutex_lock(&session->mutex);
 	session->remote_call = TRUE;
 	session->call_id = call_id;
+	session->remote_video_seen = FALSE;
 	g_free(session->remote_username);
 	session->remote_username = g_strdup(remote_username);
 	janus_mutex_unlock(&session->mutex);
@@ -679,16 +691,28 @@ static void janus_audiocall_link_send_hangup(guint32 call_id, const char *reason
 	json_decref(msg);
 }
 
-/* Forward one RTP packet of a cross-server call to the peer server: 'R' + call_id + RTP */
-static void janus_audiocall_link_send_rtp(guint32 call_id, const char *buf, uint16_t len) {
+/* Forward one RTP packet of a cross-server call to the peer server:
+ * 'A' (audio) or 'V' (video) + call_id + RTP */
+static void janus_audiocall_link_send_rtp(guint32 call_id, gboolean video, const char *buf, uint16_t len) {
 	if(link_fd < 0 || buf == NULL || len < 12 || len > 1500)
 		return;
 	char out[1505];
-	out[0] = 'R';
+	out[0] = video ? 'V' : 'A';
 	guint32 nid = htonl(call_id);
 	memcpy(out + 1, &nid, sizeof(nid));
 	memcpy(out + 5, buf, len);
 	sendto(link_fd, out, len + 5, 0, (struct sockaddr *)&link_peer_addr, sizeof(link_peer_addr));
+}
+
+/* Ask the peer server for a video keyframe for a cross-server call: 'K' + call_id */
+static void janus_audiocall_link_send_keyframe_request(guint32 call_id) {
+	if(link_fd < 0)
+		return;
+	char out[5];
+	out[0] = 'K';
+	guint32 nid = htonl(call_id);
+	memcpy(out + 1, &nid, sizeof(nid));
+	sendto(link_fd, out, sizeof(out), 0, (struct sockaddr *)&link_peer_addr, sizeof(link_peer_addr));
 }
 
 /* End a local user's cross-server call because of the peer (or the link): notify the user and close the PeerConnection */
@@ -803,7 +827,7 @@ static void janus_audiocall_link_handle(json_t *msg) {
 			return;
 		}
 		char reason[256];
-		if(!janus_audiocall_sdp_is_audio_only(sdp, reason, sizeof(reason))) {
+		if(!janus_audiocall_sdp_allowed(sdp, reason, sizeof(reason))) {
 			janus_audiocall_link_send_hangup(call_id, reason);
 			return;
 		}
@@ -932,23 +956,48 @@ static void *janus_audiocall_link_thread(void *data) {
 				inet_ntop(AF_INET, &from.sin_addr, addr, sizeof(addr)) ? addr : "?");
 			continue;
 		}
-		if(buffer[0] == 'R') {
-			/* Audio of a cross-server call: 'R' + call_id (4 bytes) + RTP packet */
+		if(buffer[0] == 'A' || buffer[0] == 'V') {
+			/* Media of a cross-server call: 'A'/'V' + call_id (4 bytes) + RTP packet */
 			if(len < 5 + 12)
+				continue;
+			gboolean video = (buffer[0] == 'V');
+#ifndef IC_VIDEO
+			if(video)
+				continue;	/* the audio plugin never relays video */
+#endif
+			guint32 nid = 0;
+			memcpy(&nid, buffer + 1, sizeof(nid));
+			guint32 call_id = ntohl(nid);
+			janus_audiocall_session *session = janus_audiocall_remote_get(call_id);
+			if(session != NULL) {
+				if(!g_atomic_int_get(&session->destroyed) && !g_atomic_int_get(&session->hangingup)) {
+					/* First video packet of this call: ask the sender for a keyframe right away */
+					if(video && !session->remote_video_seen) {
+						session->remote_video_seen = TRUE;
+						janus_audiocall_link_send_keyframe_request(call_id);
+					}
+					janus_plugin_rtp packet;
+					janus_plugin_rtp_reset(&packet);
+					packet.mindex = -1;
+					packet.video = video;
+					packet.buffer = buffer + 5;
+					packet.length = (uint16_t)(len - 5);
+					gateway->relay_rtp(session->handle, &packet);
+				}
+				janus_refcount_decrease(&session->ref);
+			}
+			continue;
+		}
+		if(buffer[0] == 'K') {
+			/* The peer's user needs a keyframe: ask OUR user (the video sender) for one */
+			if(len < 5)
 				continue;
 			guint32 nid = 0;
 			memcpy(&nid, buffer + 1, sizeof(nid));
 			janus_audiocall_session *session = janus_audiocall_remote_get(ntohl(nid));
 			if(session != NULL) {
-				if(!g_atomic_int_get(&session->destroyed) && !g_atomic_int_get(&session->hangingup)) {
-					janus_plugin_rtp packet;
-					janus_plugin_rtp_reset(&packet);
-					packet.mindex = -1;
-					packet.video = FALSE;
-					packet.buffer = buffer + 5;
-					packet.length = (uint16_t)(len - 5);
-					gateway->relay_rtp(session->handle, &packet);
-				}
+				if(!g_atomic_int_get(&session->destroyed) && !g_atomic_int_get(&session->hangingup))
+					gateway->send_pli(session->handle);
 				janus_refcount_decrease(&session->ref);
 			}
 			continue;
@@ -1366,11 +1415,18 @@ void janus_audiocall_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp
 			JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
 			return;
 		}
-		/* IC: cross-server call, forward our user's audio to the peer server */
+		/* IC: cross-server call, forward our user's media to the peer server */
 		if(session->remote_call) {
 			guint32 call_id = session->call_id;
-			if(!packet->video && session->audio_active && call_id != 0 && !g_atomic_int_get(&session->destroyed))
-				janus_audiocall_link_send_rtp(call_id, packet->buffer, packet->length);
+			if(call_id == 0 || g_atomic_int_get(&session->destroyed))
+				return;
+#ifdef IC_VIDEO
+			if(packet->video ? session->video_active : session->audio_active)
+				janus_audiocall_link_send_rtp(call_id, packet->video, packet->buffer, packet->length);
+#else
+			if(!packet->video && session->audio_active)
+				janus_audiocall_link_send_rtp(call_id, FALSE, packet->buffer, packet->length);
+#endif
 			return;
 		}
 		janus_audiocall_session *peer = session->peer;
@@ -1380,9 +1436,11 @@ void janus_audiocall_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp
 		}
 		if(g_atomic_int_get(&session->destroyed) || g_atomic_int_get(&peer->destroyed))
 			return;
+#ifndef IC_VIDEO
 		/* IC: audio-only plugin, never relay video packets */
 		if(packet->video)
 			return;
+#endif
 		gboolean video = packet->video;
 		char *buf = packet->buffer;
 		uint16_t len = packet->length;
@@ -1466,9 +1524,20 @@ void janus_audiocall_incoming_rtcp(janus_plugin_session *handle, janus_plugin_rt
 			JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
 			return;
 		}
-		/* IC: cross-server call, RTCP stays on each server (Janus handles it per PeerConnection) */
-		if(session->remote_call)
+		/* IC: cross-server call. RTCP stays on each server (Janus handles it per
+		 * PeerConnection), except keyframe requests: if our user can't decode the
+		 * peer's video, ask the peer server to get a keyframe from its user. */
+		if(session->remote_call) {
+#ifdef IC_VIDEO
+			if(packet->video && (janus_rtcp_has_pli(packet->buffer, packet->length) ||
+					janus_rtcp_has_fir(packet->buffer, packet->length))) {
+				guint32 call_id = session->call_id;
+				if(call_id != 0)
+					janus_audiocall_link_send_keyframe_request(call_id);
+			}
+#endif
 			return;
+		}
 		janus_audiocall_session *peer = session->peer;
 		if(!peer) {
 			JANUS_LOG(LOG_ERR, "Session has no peer...\n");
@@ -1684,9 +1753,10 @@ static void janus_audiocall_hangup_media_internal(janus_plugin_session *handle) 
 	g_atomic_int_set(&session->hangingup, 0);
 }
 
-/* IC: AudioCall only allows audio. Returns TRUE if the SDP has an audio
- * m-line and no active video or data m-line; otherwise writes why in reason. */
-static gboolean janus_audiocall_sdp_is_audio_only(const char *sdp_text, char *reason, size_t reason_len) {
+/* IC: media policy. Returns TRUE if the SDP has an audio m-line and no active
+ * m-line that is not allowed (audio build: no video/data; video build: no data);
+ * otherwise writes why in reason. */
+static gboolean janus_audiocall_sdp_allowed(const char *sdp_text, char *reason, size_t reason_len) {
 	char error_str[512];
 	janus_sdp *sdp = janus_sdp_parse(sdp_text, error_str, sizeof(error_str));
 	if(sdp == NULL) {
@@ -1700,6 +1770,10 @@ static gboolean janus_audiocall_sdp_is_audio_only(const char *sdp_text, char *re
 		if(m->port > 0) {
 			if(m->type == JANUS_SDP_AUDIO)
 				has_audio = TRUE;
+#ifdef IC_VIDEO
+			else if(m->type == JANUS_SDP_VIDEO)
+				;	/* video is allowed in the CustomVideoCall plugin */
+#endif
 			else if(m->direction != JANUS_SDP_INACTIVE)
 				has_other = TRUE;
 		}
@@ -1707,7 +1781,11 @@ static gboolean janus_audiocall_sdp_is_audio_only(const char *sdp_text, char *re
 	}
 	janus_sdp_destroy(sdp);
 	if(has_other) {
+#ifdef IC_VIDEO
+		g_snprintf(reason, reason_len, "AudioCall: data channels are not allowed");
+#else
 		g_snprintf(reason, reason_len, "AudioCall is audio-only: video and data are not allowed");
+#endif
 		return FALSE;
 	}
 	if(!has_audio) {
@@ -1771,7 +1849,7 @@ static void *janus_audiocall_handler(void *data) {
 		/* IC: reject any offer/answer that is not audio-only */
 		if(msg_sdp != NULL) {
 			char sdp_reason[256];
-			if(!janus_audiocall_sdp_is_audio_only(msg_sdp, sdp_reason, sizeof(sdp_reason))) {
+			if(!janus_audiocall_sdp_allowed(msg_sdp, sdp_reason, sizeof(sdp_reason))) {
 				JANUS_LOG(LOG_WARN, "[AudioCall] Rejecting SDP from %s: %s\n",
 					session->username ? session->username : "(not registered)", sdp_reason);
 				error_code = JANUS_AUDIOCALL_ERROR_AUDIO_ONLY;

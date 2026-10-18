@@ -19,7 +19,9 @@
 </style>
 </head>
 <body>
-<h2>AudioCall plugin test</h2>
+<h2 id="title">AudioCall plugin test</h2>
+<p style="font-size:13px">Mode: <a href="?">audio (janus.plugin.audiocall)</a> |
+  <a href="?plugin=video">video (janus.plugin.customvideocall)</a></p>
 
 <fieldset>
   <legend>1. Connect</legend>
@@ -41,15 +43,23 @@
   <button id="btnList" disabled>List users (both servers)</button>
   <button id="btnLocate" disabled>Locate "Call user"</button>
   <div id="stats">Audio received: -</div>
+  <div id="vstats">Video received: -</div>
   <audio id="remoteAudio" autoplay></audio>
+  <video id="remoteVideo" autoplay playsinline muted width="320" height="240" style="background:#000"></video>
 </fieldset>
 
 <div id="log"></div>
 
 <script>
-const PLUGIN = "janus.plugin.audiocall";
+const VIDEO_MODE = new URLSearchParams(location.search).get("plugin") === "video";
+const PLUGIN = VIDEO_MODE ? "janus.plugin.customvideocall" : "janus.plugin.audiocall";
 const $ = (id) => document.getElementById(id);
 $("server").value = "ws://" + (location.hostname || "localhost") + ":8188";
+if (VIDEO_MODE) {
+  $("title").textContent = "CustomVideoCall plugin test";
+  $("btnVideo").textContent = "Video call";
+  $("btnVideo").title = "Audio + video call";
+}
 
 let janus = null, handle = null, statsTimer = null;
 
@@ -73,6 +83,10 @@ function startStats() {
     if (!pc) return;
     const report = await pc.getStats();
     report.forEach((s) => {
+      if (s.type === "inbound-rtp" && s.kind === "video") {
+        $("vstats").textContent = "Video received: " + s.packetsReceived +
+          " packets, " + (s.framesDecoded || 0) + " frames decoded";
+      }
       if (s.type === "inbound-rtp" && s.kind === "audio") {
         $("stats").textContent = "Audio received: " + s.packetsReceived +
           " packets, " + s.bytesReceived + " bytes";
@@ -146,7 +160,9 @@ $("btnConnect").onclick = () => {
                 log("Incoming call from " + result.username + " - answering (audio only)");
                 handle.createAnswer({
                   jsep: jsep,
-                  tracks: [{ type: "audio", capture: true, recv: true }],
+                  tracks: VIDEO_MODE
+                    ? [{ type: "audio", capture: true, recv: true }, { type: "video", capture: true, recv: true }]
+                    : [{ type: "audio", capture: true, recv: true }],
                   success: (answer) => {
                     handle.send({ message: { request: "accept" }, jsep: answer });
                     setInCall(true);
@@ -168,6 +184,9 @@ $("btnConnect").onclick = () => {
             },
             onremotetrack: (track, mid, on) => {
               log("Remote " + track.kind + " track " + (on ? "added" : "removed"));
+              if (on && track.kind === "video") {
+                $("remoteVideo").srcObject = new MediaStream([track]);
+              }
               if (on && track.kind === "audio") {
                 $("remoteAudio").srcObject = new MediaStream([track]);
               }

@@ -1072,6 +1072,9 @@ AM_COND_IF([ENABLE_PLUGIN_VIDEOCALL],
 AM_COND_IF([ENABLE_PLUGIN_AUDIOCALL],
 	[echo "    Audio Call (IC):       yes"],
 	[echo "    Audio Call (IC):       no"])
+AM_COND_IF([ENABLE_PLUGIN_AUDIOCALL],
+	[echo "    Custom Video Call:     yes"],
+	[echo "    Custom Video Call:     no"])
 AM_COND_IF([ENABLE_PLUGIN_SIP],
 	[echo "    SIP Gateway:           yes"],
 	[echo "    SIP Gateway:           no"])

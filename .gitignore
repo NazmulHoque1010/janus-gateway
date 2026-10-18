@@ -73,3 +73,6 @@ cov-int
 .vscode
 node_modules
 .venv
+
+# IC: generated from src/plugins/janus_audiocall.c at build time
+/src/plugins/janus_customvideocall.c

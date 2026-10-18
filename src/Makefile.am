@@ -493,6 +493,22 @@ plugins_libjanus_audiocall_la_LDFLAGS = $(plugins_ldflags)
 plugins_libjanus_audiocall_la_LIBADD = $(plugins_libadd)
 conf_DATA += ../conf/janus.plugin.audiocall.jcfg.sample
 EXTRA_DIST += ../conf/janus.plugin.audiocall.jcfg.sample
+
+# CustomVideoCall plugin: generated from janus_audiocall.c with every name renamed
+# (so the two plugins share no symbols) and built with -DIC_VIDEO (video allowed)
+plugin_LTLIBRARIES += plugins/libjanus_customvideocall.la
+nodist_plugins_libjanus_customvideocall_la_SOURCES = plugins/janus_customvideocall.c
+plugins_libjanus_customvideocall_la_CFLAGS = $(plugins_cflags) -DIC_VIDEO
+plugins_libjanus_customvideocall_la_LDFLAGS = $(plugins_ldflags)
+plugins_libjanus_customvideocall_la_LIBADD = $(plugins_libadd)
+conf_DATA += ../conf/janus.plugin.customvideocall.jcfg.sample
+EXTRA_DIST += ../conf/janus.plugin.customvideocall.jcfg.sample
+BUILT_SOURCES += plugins/janus_customvideocall.c
+CLEANFILES += plugins/janus_customvideocall.c
+
+plugins/janus_customvideocall.c: plugins/janus_audiocall.c
+	$(AM_V_GEN)sed -e 's/audiocall/customvideocall/g' -e 's/AUDIOCALL/CUSTOMVIDEOCALL/g' \
+		-e 's/AudioCall/CustomVideoCall/g' $< > $@
 endif
 
 if ENABLE_PLUGIN_VIDEOROOM
