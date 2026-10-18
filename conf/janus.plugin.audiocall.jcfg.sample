@@ -1,19 +1,20 @@
 # AudioCall plugin (IC project): audio-only calls between users,
-# on this Janus server or on a peer Janus server.
+# on this Janus server or on any other Janus server on the LAN.
 #
 # events = true|false, whether events should be sent to event handlers
 #
-# Peer link (to the AudioCall plugin on the other Janus server):
-# server_name = name of THIS server, shown in logs and replies
-# link_port   = UDP port this plugin listens on for the peer link
-# peer_host   = IPv4 address of the other Janus server (leave unset to
-#               disable the peer link and allow local calls only)
-# peer_port   = UDP port the other server's plugin listens on
+# Link to the other Janus servers. Nothing about them is configured: every
+# server broadcasts an announcement on the LAN every 2 seconds, and learns
+# the others (and who is registered on them) from their announcements.
+# server_name = name of THIS server, must be unique (default: the host name)
+# link_port   = UDP port of the link, the SAME on every server (7088);
+#               0 disables the link (local calls only)
+# ws_port     = WebSocket port of this Janus, told to apps that discover
+#               the servers (default 8188)
 
 general: {
 	#events = false
 	#server_name = "pc1"
 	#link_port = 7088
-	#peer_host = "192.168.99.112"
-	#peer_port = 7088
+	#ws_port = 8188
 }

@@ -274,6 +274,8 @@
 #include <poll.h>
 #include <unistd.h>
 #include <errno.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 
 
 /* Plugin information */
@@ -417,6 +419,8 @@ typedef struct janus_audiocall_session {
 	guint32 call_id;			/* Identifies the call on the peer link */
 	char *remote_username;		/* Username of our partner on the peer server */
 	gboolean remote_video_seen;	/* Got the first video packet from the peer (keyframe requested) */
+	struct sockaddr_in remote_addr;	/* Link address of the server our partner is on */
+	char *remote_server;		/* Name of that server */
 	janus_mutex mutex;
 	janus_refcount ref;
 } janus_audiocall_session;
@@ -439,6 +443,7 @@ static void janus_audiocall_session_free(const janus_refcount *session_ref) {
 	/* This session can be destroyed, free all the resources */
 	g_free(session->username);
 	g_free(session->remote_username);
+	g_free(session->remote_server);
 	janus_mutex_destroy(&session->mutex);
 	janus_mutex_destroy(&session->rid_mutex);
 	janus_mutex_destroy(&session->rec_mutex);
@@ -490,39 +495,68 @@ static void janus_audiocall_message_free(janus_audiocall_message *msg) {
 
 
 /* ===========================================================================
- * IC: peer link between the AudioCall plugins of the two Janus servers.
+ * IC: link between the plugins of all the Janus servers on the LAN.
  *
- * Each plugin listens on a UDP port (link_port) and talks to the other
- * server's plugin (peer_host:peer_port) with small JSON messages:
- *   ping / pong                    keep-alive, tells us the peer is up
- *   lookup / lookup_result         "is this user registered on your side?"
- *   list / list_result             "which users are registered on your side?"
- * Requests carry a "tid" (transaction id) that the reply copies back.
- * Only packets coming from peer_host are accepted.
+ * Nothing about other servers is configured. Every plugin listens on a UDP
+ * port (link_port, the same on every server) and, every 2 seconds, broadcasts
+ *   {"type":"hello","server":"pc1","users":["Nazmul"],"ws_port":8188}
+ * on the LAN. Every server builds its table of servers from these
+ * announcements: name, address and who is registered there. A server that
+ * stays silent for 6 seconds is dropped from the table.
+ *
+ * Apps find the servers the same way: they broadcast {"type":"discover"}
+ * and each server answers {"type":"here","server":...,"users":N,"ws_port":...}.
+ *
+ * Calls between servers use unicast messages to the other server
+ * (call / accepted / hangup) and media packets 'A'/'V'/'K' + call_id.
+ * Media is only accepted from the address the call was set up with.
  * ======================================================================== */
 static gboolean link_enabled = FALSE;
 static char *link_server_name = NULL;
-static char *link_peer_host = NULL;
-static uint16_t link_local_port = JANUS_AUDIOCALL_DEFAULT_LINK_PORT, link_peer_port = JANUS_AUDIOCALL_DEFAULT_LINK_PORT;
+static uint16_t link_local_port = JANUS_AUDIOCALL_DEFAULT_LINK_PORT, link_ws_port = 8188;
 static int link_fd = -1;
-static struct sockaddr_in link_peer_addr;
 static GThread *link_thread = NULL;
-static volatile gint link_peer_up = 0;
-static char *link_peer_name = NULL;		/* protected by link_mutex */
-static gint64 link_last_seen = 0;		/* protected by link_mutex */
-static janus_mutex link_mutex = JANUS_MUTEX_INITIALIZER;
-static janus_condition link_cond;
-static guint link_next_tid = 0;			/* protected by link_mutex */
-static GHashTable *link_replies = NULL;	/* tid -> reply (json_t *), protected by link_mutex */
+static volatile gint link_dirty = 0;			/* our users changed: announce now */
+static volatile gint link_online_dirty = 1;		/* someone's users changed: refresh our users' online lists */
+static char *link_last_online = NULL;			/* last online list pushed (link thread only) */
 
-#define JANUS_AUDIOCALL_LINK_TIMEOUT		(1500 * G_TIME_SPAN_MILLISECOND)
+/* Another Janus server, learned from its announcements */
+typedef struct janus_audiocall_peer {
+	char *name;
+	struct sockaddr_in addr;	/* where its plugin's link socket is */
+	json_t *users;				/* usernames registered there (sorted array) */
+	gint64 last_seen;
+} janus_audiocall_peer;
+static GHashTable *link_peers = NULL;	/* name -> janus_audiocall_peer, protected by link_mutex */
+static janus_mutex link_mutex = JANUS_MUTEX_INITIALIZER;
+
+#define JANUS_AUDIOCALL_LINK_HELLO_EVERY	(2 * G_TIME_SPAN_SECOND)
+#define JANUS_AUDIOCALL_LINK_DEAD_AFTER		(6 * G_TIME_SPAN_SECOND)
 
 /* IC: cross-server calls in progress on THIS server: call_id -> local session (the table holds a reference) */
 static GHashTable *remote_calls = NULL;
 static janus_mutex remote_calls_mutex = JANUS_MUTEX_INITIALIZER;
 static gboolean janus_audiocall_sdp_allowed(const char *sdp_text, char *reason, size_t reason_len);
-#define JANUS_AUDIOCALL_LINK_PING_EVERY		(5 * G_TIME_SPAN_SECOND)
-#define JANUS_AUDIOCALL_LINK_DEAD_AFTER		(15 * G_TIME_SPAN_SECOND)
+
+static void janus_audiocall_peer_free(janus_audiocall_peer *peer) {
+	if(peer == NULL)
+		return;
+	g_free(peer->name);
+	json_decref(peer->users);
+	g_free(peer);
+}
+
+static gboolean janus_audiocall_same_addr(const struct sockaddr_in *a, const struct sockaddr_in *b) {
+	return a->sin_addr.s_addr == b->sin_addr.s_addr && a->sin_port == b->sin_port;
+}
+
+static const char *janus_audiocall_addr_str(const struct sockaddr_in *a, char *buf, size_t len) {
+	char ip[INET_ADDRSTRLEN];
+	if(inet_ntop(AF_INET, &a->sin_addr, ip, sizeof(ip)) == NULL)
+		g_strlcpy(ip, "?", sizeof(ip));
+	g_snprintf(buf, len, "%s:%d", ip, ntohs(a->sin_port));
+	return buf;
+}
 
 /* Is this username registered on THIS server? (caller must not hold sessions_mutex) */
 static gboolean janus_audiocall_is_local_user(const char *username) {
@@ -535,9 +569,9 @@ static gboolean janus_audiocall_is_local_user(const char *username) {
 	return found;
 }
 
-/* Usernames registered on THIS server, as a JSON array (caller must not hold sessions_mutex) */
+/* Usernames registered on THIS server, as a sorted JSON array (caller must not hold sessions_mutex) */
 static json_t *janus_audiocall_local_users(void) {
-	json_t *list = json_array();
+	GList *names = NULL;
 	janus_mutex_lock(&sessions_mutex);
 	if(usernames != NULL) {
 		GHashTableIter iter;
@@ -546,83 +580,123 @@ static json_t *janus_audiocall_local_users(void) {
 		while(g_hash_table_iter_next(&iter, &key, &value)) {
 			janus_audiocall_session *user = value;
 			if(user != NULL && !g_atomic_int_get(&user->destroyed))
-				json_array_append_new(list, json_string((const char *)key));
+				names = g_list_prepend(names, g_strdup((const char *)key));
 		}
 	}
 	janus_mutex_unlock(&sessions_mutex);
+	names = g_list_sort(names, (GCompareFunc)g_strcmp0);
+	json_t *list = json_array();
+	GList *temp = names;
+	while(temp) {
+		json_array_append_new(list, json_string((const char *)temp->data));
+		temp = temp->next;
+	}
+	g_list_free_full(names, g_free);
 	return list;
 }
 
-/* Send one JSON message to the peer server */
-static void janus_audiocall_link_send(json_t *msg) {
-	if(link_fd < 0 || msg == NULL)
+/* Send one JSON message to another server (or app) */
+static void janus_audiocall_link_send_to(const struct sockaddr_in *to, json_t *msg) {
+	if(link_fd < 0 || to == NULL || msg == NULL)
 		return;
 	char *text = json_dumps(msg, JSON_COMPACT);
 	if(text == NULL)
 		return;
-	if(sendto(link_fd, text, strlen(text), 0,
-			(struct sockaddr *)&link_peer_addr, sizeof(link_peer_addr)) < 0) {
-		JANUS_LOG(LOG_WARN, "[AudioCall] Peer link send error: %s\n", g_strerror(errno));
+	if(sendto(link_fd, text, strlen(text), 0, (const struct sockaddr *)to, sizeof(*to)) < 0) {
+		char addr[64];
+		JANUS_LOG(LOG_WARN, "[AudioCall] Link send error to %s: %s\n",
+			janus_audiocall_addr_str(to, addr, sizeof(addr)), g_strerror(errno));
 	}
 	free(text);
 }
 
-/* Send a request to the peer and wait for its reply.
- * Takes ownership of request; returns the reply (caller must json_decref it)
- * or NULL if the peer did not answer in time. Never call with sessions_mutex held. */
-static json_t *janus_audiocall_link_request(json_t *request) {
-	if(!link_enabled || link_fd < 0 || !g_atomic_int_get(&link_peer_up)) {
-		/* No peer link, or the peer is known to be down: don't wait for nothing */
-		json_decref(request);
-		return NULL;
-	}
+/* Is this username registered on another server? If so, returns TRUE and,
+ * optionally, that server's link address and name (caller frees the name) */
+static gboolean janus_audiocall_peer_find_user(const char *username, struct sockaddr_in *addr, char **server) {
+	if(username == NULL)
+		return FALSE;
+	gboolean found = FALSE;
 	janus_mutex_lock(&link_mutex);
-	guint tid = ++link_next_tid;
-	janus_mutex_unlock(&link_mutex);
-	json_object_set_new(request, "tid", json_integer(tid));
-	json_object_set_new(request, "server", json_string(link_server_name));
-	janus_audiocall_link_send(request);
-	json_decref(request);
-	/* Wait for the link thread to deliver the reply */
-	gint64 end = g_get_monotonic_time() + JANUS_AUDIOCALL_LINK_TIMEOUT;
-	json_t *reply = NULL;
-	janus_mutex_lock(&link_mutex);
-	while((reply = g_hash_table_lookup(link_replies, GUINT_TO_POINTER(tid))) == NULL &&
-			g_get_monotonic_time() < end) {
-		janus_condition_wait_until(&link_cond, &link_mutex, end);
+	if(link_peers != NULL) {
+		GHashTableIter iter;
+		gpointer value;
+		g_hash_table_iter_init(&iter, link_peers);
+		while(!found && g_hash_table_iter_next(&iter, NULL, &value)) {
+			janus_audiocall_peer *peer = value;
+			size_t i = 0;
+			for(i = 0; i < json_array_size(peer->users); i++) {
+				const char *u = json_string_value(json_array_get(peer->users, i));
+				if(u != NULL && !strcmp(u, username)) {
+					found = TRUE;
+					if(addr)
+						*addr = peer->addr;
+					if(server)
+						*server = g_strdup(peer->name);
+					break;
+				}
+			}
+		}
 	}
-	if(reply != NULL)
-		g_hash_table_steal(link_replies, GUINT_TO_POINTER(tid));
 	janus_mutex_unlock(&link_mutex);
-	if(reply == NULL)
-		JANUS_LOG(LOG_WARN, "[AudioCall] Peer %s:%d did not answer (tid %u)\n", link_peer_host, link_peer_port, tid);
-	return reply;
+	return found;
 }
 
-/* Ask the peer whether a user is registered there.
- * Returns 1 = yes, 0 = no, -1 = peer not reachable */
-static int janus_audiocall_link_lookup(const char *username) {
-	json_t *request = json_object();
-	json_object_set_new(request, "type", json_string("lookup"));
-	json_object_set_new(request, "user", json_string(username));
-	json_t *reply = janus_audiocall_link_request(request);
-	if(reply == NULL)
-		return -1;
-	int result = json_is_true(json_object_get(reply, "registered")) ? 1 : 0;
-	json_decref(reply);
-	return result;
+/* What we know about the other servers, as
+ *   {"peer_online":bool, "peer_server":"pc2, pc3", "peer_list":[all their users],
+ *    "servers":[{"server":"pc2","ip":"192.168.99.112","users":[...]}, ...]}
+ * (sorted by server name, so the result only changes when something changed) */
+static json_t *janus_audiocall_peer_info(void) {
+	json_t *info = json_object();
+	json_t *peer_list = json_array();
+	json_t *servers = json_array();
+	GString *names = g_string_new(NULL);
+	janus_mutex_lock(&link_mutex);
+	GList *peers = link_peers ? g_hash_table_get_keys(link_peers) : NULL;
+	peers = g_list_sort(peers, (GCompareFunc)g_strcmp0);
+	GList *temp = peers;
+	while(temp) {
+		janus_audiocall_peer *peer = g_hash_table_lookup(link_peers, temp->data);
+		if(peer != NULL) {
+			char ip[INET_ADDRSTRLEN];
+			if(inet_ntop(AF_INET, &peer->addr.sin_addr, ip, sizeof(ip)) == NULL)
+				g_strlcpy(ip, "?", sizeof(ip));
+			json_t *s = json_object();
+			json_object_set_new(s, "server", json_string(peer->name));
+			json_object_set_new(s, "ip", json_string(ip));
+			json_object_set_new(s, "users", json_deep_copy(peer->users));
+			json_array_append_new(servers, s);
+			json_array_extend(peer_list, peer->users);
+			if(names->len > 0)
+				g_string_append(names, ", ");
+			g_string_append(names, peer->name);
+		}
+		temp = temp->next;
+	}
+	janus_mutex_unlock(&link_mutex);
+	g_list_free(peers);
+	json_object_set_new(info, "peer_online", json_array_size(servers) > 0 ? json_true() : json_false());
+	if(names->len > 0)
+		json_object_set_new(info, "peer_server", json_string(names->str));
+	json_object_set_new(info, "peer_list", peer_list);
+	json_object_set_new(info, "servers", servers);
+	g_string_free(names, TRUE);
+	return info;
 }
 
 /* ---- IC: cross-server call helpers ---- */
 
-/* Mark a local session as being in a cross-server call */
-static void janus_audiocall_remote_add(janus_audiocall_session *session, guint32 call_id, const char *remote_username) {
+/* Mark a local session as being in a cross-server call with a user on another server */
+static void janus_audiocall_remote_add(janus_audiocall_session *session, guint32 call_id, const char *remote_username,
+		const struct sockaddr_in *remote_addr, const char *remote_server) {
 	janus_mutex_lock(&session->mutex);
 	session->remote_call = TRUE;
 	session->call_id = call_id;
 	session->remote_video_seen = FALSE;
+	session->remote_addr = *remote_addr;
 	g_free(session->remote_username);
 	session->remote_username = g_strdup(remote_username);
+	g_free(session->remote_server);
+	session->remote_server = g_strdup(remote_server ? remote_server : "?");
 	janus_mutex_unlock(&session->mutex);
 	janus_refcount_increase(&session->ref);
 	janus_mutex_lock(&remote_calls_mutex);
@@ -632,7 +706,8 @@ static void janus_audiocall_remote_add(janus_audiocall_session *session, guint32
 
 /* Take a local session out of its cross-server call. Returns FALSE if it wasn't in one.
  * The caller must hold its own reference to the session. */
-static gboolean janus_audiocall_remote_detach(janus_audiocall_session *session, guint32 *call_id, char **remote_username) {
+static gboolean janus_audiocall_remote_detach(janus_audiocall_session *session, guint32 *call_id,
+		char **remote_username, struct sockaddr_in *remote_addr) {
 	janus_mutex_lock(&session->mutex);
 	if(!session->remote_call) {
 		janus_mutex_unlock(&session->mutex);
@@ -640,9 +715,13 @@ static gboolean janus_audiocall_remote_detach(janus_audiocall_session *session, 
 	}
 	guint32 id = session->call_id;
 	char *user = session->remote_username;
+	if(remote_addr)
+		*remote_addr = session->remote_addr;
 	session->remote_call = FALSE;
 	session->call_id = 0;
 	session->remote_username = NULL;
+	g_free(session->remote_server);
+	session->remote_server = NULL;
 	janus_mutex_unlock(&session->mutex);
 	g_atomic_int_set(&session->incall, 0);
 	janus_mutex_lock(&remote_calls_mutex);
@@ -680,20 +759,20 @@ static void janus_audiocall_push_result(janus_audiocall_session *session, json_t
 		json_decref(jsep);
 }
 
-/* Tell the peer server that a cross-server call has ended */
-static void janus_audiocall_link_send_hangup(guint32 call_id, const char *reason) {
+/* Tell the other server that a cross-server call has ended */
+static void janus_audiocall_link_send_hangup(const struct sockaddr_in *to, guint32 call_id, const char *reason) {
 	json_t *msg = json_object();
 	json_object_set_new(msg, "type", json_string("hangup"));
 	json_object_set_new(msg, "call_id", json_integer(call_id));
 	json_object_set_new(msg, "reason", json_string(reason ? reason : "Hangup"));
 	json_object_set_new(msg, "server", json_string(link_server_name));
-	janus_audiocall_link_send(msg);
+	janus_audiocall_link_send_to(to, msg);
 	json_decref(msg);
 }
 
-/* Forward one RTP packet of a cross-server call to the peer server:
+/* Forward one RTP packet of a cross-server call to the other server:
  * 'A' (audio) or 'V' (video) + call_id + RTP */
-static void janus_audiocall_link_send_rtp(guint32 call_id, gboolean video, const char *buf, uint16_t len) {
+static void janus_audiocall_link_send_rtp(const struct sockaddr_in *to, guint32 call_id, gboolean video, const char *buf, uint16_t len) {
 	if(link_fd < 0 || buf == NULL || len < 12 || len > 1500)
 		return;
 	char out[1505];
@@ -701,24 +780,24 @@ static void janus_audiocall_link_send_rtp(guint32 call_id, gboolean video, const
 	guint32 nid = htonl(call_id);
 	memcpy(out + 1, &nid, sizeof(nid));
 	memcpy(out + 5, buf, len);
-	sendto(link_fd, out, len + 5, 0, (struct sockaddr *)&link_peer_addr, sizeof(link_peer_addr));
+	sendto(link_fd, out, len + 5, 0, (const struct sockaddr *)to, sizeof(*to));
 }
 
-/* Ask the peer server for a video keyframe for a cross-server call: 'K' + call_id */
-static void janus_audiocall_link_send_keyframe_request(guint32 call_id) {
+/* Ask the other server for a video keyframe for a cross-server call: 'K' + call_id */
+static void janus_audiocall_link_send_keyframe_request(const struct sockaddr_in *to, guint32 call_id) {
 	if(link_fd < 0)
 		return;
 	char out[5];
 	out[0] = 'K';
 	guint32 nid = htonl(call_id);
 	memcpy(out + 1, &nid, sizeof(nid));
-	sendto(link_fd, out, sizeof(out), 0, (struct sockaddr *)&link_peer_addr, sizeof(link_peer_addr));
+	sendto(link_fd, out, sizeof(out), 0, (const struct sockaddr *)to, sizeof(*to));
 }
 
-/* End a local user's cross-server call because of the peer (or the link): notify the user and close the PeerConnection */
+/* End a local user's cross-server call because of the other side (or the link): notify the user and close the PeerConnection */
 static void janus_audiocall_remote_hangup_local(janus_audiocall_session *session, const char *reason) {
 	char *remote_user = NULL;
-	if(!janus_audiocall_remote_detach(session, NULL, &remote_user))
+	if(!janus_audiocall_remote_detach(session, NULL, &remote_user, NULL))
 		return;
 	json_t *result = json_object();
 	json_object_set_new(result, "event", json_string("hangup"));
@@ -729,8 +808,8 @@ static void janus_audiocall_remote_hangup_local(janus_audiocall_session *session
 	g_free(remote_user);
 }
 
-/* End all cross-server calls (e.g., the peer server went away) */
-static void janus_audiocall_remote_end_all(const char *reason) {
+/* End the cross-server calls with one server (NULL = all of them), e.g. because it went away */
+static void janus_audiocall_remote_end_peer(const char *server, const char *reason) {
 	GList *list = NULL;
 	janus_mutex_lock(&remote_calls_mutex);
 	if(remote_calls != NULL) {
@@ -739,8 +818,13 @@ static void janus_audiocall_remote_end_all(const char *reason) {
 		g_hash_table_iter_init(&iter, remote_calls);
 		while(g_hash_table_iter_next(&iter, NULL, &value)) {
 			janus_audiocall_session *session = value;
-			janus_refcount_increase(&session->ref);
-			list = g_list_prepend(list, session);
+			janus_mutex_lock(&session->mutex);
+			gboolean match = (server == NULL || !g_strcmp0(session->remote_server, server));
+			janus_mutex_unlock(&session->mutex);
+			if(match) {
+				janus_refcount_increase(&session->ref);
+				list = g_list_prepend(list, session);
+			}
 		}
 	}
 	janus_mutex_unlock(&remote_calls_mutex);
@@ -755,96 +839,174 @@ static void janus_audiocall_remote_end_all(const char *reason) {
 	g_list_free(list);
 }
 
-/* Handle one JSON message received from the peer (runs in the link thread) */
-static void janus_audiocall_link_handle(json_t *msg) {
+/* Send every local user the list of online users (here and on all the other
+ * servers), if it changed since the last time (or always, if force is TRUE).
+ * Runs in the link thread. */
+static void janus_audiocall_push_online(gboolean force) {
+	json_t *info = janus_audiocall_peer_info();
+	json_object_set_new(info, "list", janus_audiocall_local_users());
+	char *signature = json_dumps(info, JSON_COMPACT | JSON_SORT_KEYS);
+	if(!force && signature != NULL && link_last_online != NULL && !strcmp(signature, link_last_online)) {
+		free(signature);
+		json_decref(info);
+		return;
+	}
+	free(link_last_online);
+	link_last_online = signature;
+	json_object_set_new(info, "event", json_string("online"));
+	json_object_set_new(info, "server", json_string(link_server_name));
+	GList *list = NULL;
+	janus_mutex_lock(&sessions_mutex);
+	if(usernames != NULL) {
+		GHashTableIter iter;
+		gpointer value;
+		g_hash_table_iter_init(&iter, usernames);
+		while(g_hash_table_iter_next(&iter, NULL, &value)) {
+			janus_audiocall_session *user = value;
+			if(user != NULL && !g_atomic_int_get(&user->destroyed)) {
+				janus_refcount_increase(&user->ref);
+				list = g_list_prepend(list, user);
+			}
+		}
+	}
+	janus_mutex_unlock(&sessions_mutex);
+	GList *temp = list;
+	while(temp) {
+		janus_audiocall_session *user = temp->data;
+		janus_audiocall_push_result(user, json_deep_copy(info), NULL);
+		janus_refcount_decrease(&user->ref);
+		temp = temp->next;
+	}
+	g_list_free(list);
+	json_decref(info);
+}
+
+/* Broadcast our announcement on every LAN interface */
+static void janus_audiocall_link_announce(void) {
+	if(link_fd < 0)
+		return;
+	json_t *hello = json_object();
+	json_object_set_new(hello, "type", json_string("hello"));
+	json_object_set_new(hello, "server", json_string(link_server_name));
+	json_object_set_new(hello, "users", janus_audiocall_local_users());
+	json_object_set_new(hello, "ws_port", json_integer(link_ws_port));
+	char *text = json_dumps(hello, JSON_COMPACT);
+	json_decref(hello);
+	if(text == NULL)
+		return;
+	int sent = 0;
+	struct ifaddrs *ifas = NULL, *ifa = NULL;
+	if(getifaddrs(&ifas) == 0) {
+		for(ifa = ifas; ifa != NULL; ifa = ifa->ifa_next) {
+			if(ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET)
+				continue;
+			if(!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK) ||
+					!(ifa->ifa_flags & IFF_BROADCAST) || ifa->ifa_broadaddr == NULL)
+				continue;
+			struct sockaddr_in dst;
+			memcpy(&dst, ifa->ifa_broadaddr, sizeof(dst));
+			dst.sin_family = AF_INET;
+			dst.sin_port = htons(link_local_port);
+			if(sendto(link_fd, text, strlen(text), 0, (struct sockaddr *)&dst, sizeof(dst)) >= 0)
+				sent++;
+		}
+		freeifaddrs(ifas);
+	}
+	if(sent == 0) {
+		/* No usable interface found: try the generic broadcast address */
+		struct sockaddr_in dst;
+		memset(&dst, 0, sizeof(dst));
+		dst.sin_family = AF_INET;
+		dst.sin_port = htons(link_local_port);
+		dst.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+		sendto(link_fd, text, strlen(text), 0, (struct sockaddr *)&dst, sizeof(dst));
+	}
+	free(text);
+}
+
+/* Handle one JSON message received on the link (runs in the link thread) */
+static void janus_audiocall_link_handle(json_t *msg, const struct sockaddr_in *from) {
 	const char *type = json_string_value(json_object_get(msg, "type"));
 	if(type == NULL)
 		return;
-	/* Any valid message means the peer is alive */
 	const char *name = json_string_value(json_object_get(msg, "server"));
-	janus_mutex_lock(&link_mutex);
-	link_last_seen = g_get_monotonic_time();
-	if(name != NULL && (link_peer_name == NULL || strcmp(name, link_peer_name))) {
-		g_free(link_peer_name);
-		link_peer_name = g_strdup(name);
-	}
-	janus_mutex_unlock(&link_mutex);
-	if(g_atomic_int_compare_and_exchange(&link_peer_up, 0, 1)) {
-		JANUS_LOG(LOG_INFO, "[AudioCall] Peer link UP: server '%s' at %s:%d\n",
-			name ? name : "?", link_peer_host, link_peer_port);
-	}
-	json_t *tid = json_object_get(msg, "tid");
-	if(!strcmp(type, "ping")) {
-		json_t *pong = json_object();
-		json_object_set_new(pong, "type", json_string("pong"));
-		json_object_set_new(pong, "server", json_string(link_server_name));
-		janus_audiocall_link_send(pong);
-		json_decref(pong);
-	} else if(!strcmp(type, "pong")) {
-		/* Nothing else to do, link_last_seen was updated above */
-	} else if(!strcmp(type, "lookup")) {
-		const char *user = json_string_value(json_object_get(msg, "user"));
-		gboolean registered = janus_audiocall_is_local_user(user);
-		JANUS_LOG(LOG_VERB, "[AudioCall] Peer asked for '%s': %s\n", user ? user : "?", registered ? "registered here" : "not here");
-		json_t *reply = json_object();
-		json_object_set_new(reply, "type", json_string("lookup_result"));
-		if(tid)
-			json_object_set(reply, "tid", tid);
-		json_object_set_new(reply, "user", json_string(user ? user : ""));
-		json_object_set_new(reply, "registered", registered ? json_true() : json_false());
-		json_object_set_new(reply, "server", json_string(link_server_name));
-		janus_audiocall_link_send(reply);
-		json_decref(reply);
-	} else if(!strcmp(type, "list")) {
-		json_t *reply = json_object();
-		json_object_set_new(reply, "type", json_string("list_result"));
-		if(tid)
-			json_object_set(reply, "tid", tid);
-		json_object_set_new(reply, "users", janus_audiocall_local_users());
-		json_object_set_new(reply, "server", json_string(link_server_name));
-		janus_audiocall_link_send(reply);
-		json_decref(reply);
-	} else if(!strcmp(type, "lookup_result") || !strcmp(type, "list_result")) {
-		/* A reply to one of our requests: hand it to the waiting thread */
-		if(!json_is_integer(tid))
+	char addr[64];
+	if(!strcmp(type, "hello")) {
+		/* Another server's announcement (or our own, coming back from the broadcast) */
+		if(name == NULL || !strcmp(name, link_server_name))
 			return;
-		guint id = (guint)json_integer_value(tid);
+		json_t *users = json_object_get(msg, "users");
+		gboolean is_new = FALSE, moved = FALSE, changed = FALSE;
 		janus_mutex_lock(&link_mutex);
-		if(g_hash_table_size(link_replies) > 100)	/* Drop stale replies nobody waited for */
-			g_hash_table_remove_all(link_replies);
-		g_hash_table_insert(link_replies, GUINT_TO_POINTER(id), json_incref(msg));
-		janus_condition_broadcast(&link_cond);
+		janus_audiocall_peer *peer = g_hash_table_lookup(link_peers, name);
+		if(peer == NULL) {
+			peer = g_malloc0(sizeof(janus_audiocall_peer));
+			peer->name = g_strdup(name);
+			peer->users = json_array();
+			g_hash_table_insert(link_peers, peer->name, peer);
+			is_new = TRUE;
+		} else if(!janus_audiocall_same_addr(&peer->addr, from)) {
+			moved = TRUE;
+		}
+		peer->addr = *from;
+		peer->last_seen = g_get_monotonic_time();
+		json_t *new_users = json_is_array(users) ? json_incref(users) : json_array();
+		changed = is_new || !json_equal(peer->users, new_users);
+		json_decref(peer->users);
+		peer->users = new_users;
 		janus_mutex_unlock(&link_mutex);
+		if(is_new) {
+			JANUS_LOG(LOG_INFO, "[AudioCall] Discovered server '%s' at %s\n", name,
+				janus_audiocall_addr_str(from, addr, sizeof(addr)));
+			g_atomic_int_set(&link_dirty, 1);	/* Introduce ourselves right away */
+		} else if(moved) {
+			JANUS_LOG(LOG_WARN, "[AudioCall] Server '%s' is now at %s (two servers with the same server_name?)\n", name,
+				janus_audiocall_addr_str(from, addr, sizeof(addr)));
+		}
+		if(changed)
+			g_atomic_int_set(&link_online_dirty, 1);
+	} else if(!strcmp(type, "discover")) {
+		/* An app looking for a server: tell it how busy we are */
+		json_t *users = janus_audiocall_local_users();
+		json_t *reply = json_object();
+		json_object_set_new(reply, "type", json_string("here"));
+		json_object_set_new(reply, "server", json_string(link_server_name));
+		json_object_set_new(reply, "users", json_integer(json_array_size(users)));
+		json_object_set_new(reply, "ws_port", json_integer(link_ws_port));
+		json_decref(users);
+		janus_audiocall_link_send_to(from, reply);
+		json_decref(reply);
+		JANUS_LOG(LOG_VERB, "[AudioCall] Answered a discover from %s\n", janus_audiocall_addr_str(from, addr, sizeof(addr)));
 	} else if(!strcmp(type, "call")) {
-		/* The peer server has a user calling one of OUR users */
+		/* Another server has a user calling one of OUR users */
 		guint32 call_id = (guint32)json_integer_value(json_object_get(msg, "call_id"));
-		const char *from = json_string_value(json_object_get(msg, "from"));
+		const char *caller_name = json_string_value(json_object_get(msg, "from"));
 		const char *to = json_string_value(json_object_get(msg, "to"));
 		const char *sdp_type = json_string_value(json_object_get(msg, "sdp_type"));
 		const char *sdp = json_string_value(json_object_get(msg, "sdp"));
-		if(call_id == 0 || from == NULL || to == NULL || sdp_type == NULL || sdp == NULL) {
-			janus_audiocall_link_send_hangup(call_id, "Invalid call request");
+		if(call_id == 0 || caller_name == NULL || to == NULL || sdp_type == NULL || sdp == NULL) {
+			janus_audiocall_link_send_hangup(from, call_id, "Invalid call request");
 			return;
 		}
 		char reason[256];
 		if(!janus_audiocall_sdp_allowed(sdp, reason, sizeof(reason))) {
-			janus_audiocall_link_send_hangup(call_id, reason);
+			janus_audiocall_link_send_hangup(from, call_id, reason);
 			return;
 		}
 		janus_mutex_lock(&sessions_mutex);
 		janus_audiocall_session *callee = usernames ? g_hash_table_lookup(usernames, to) : NULL;
 		if(callee == NULL || g_atomic_int_get(&callee->destroyed)) {
 			janus_mutex_unlock(&sessions_mutex);
-			JANUS_LOG(LOG_WARN, "[AudioCall] Cross-server call %u from %s: '%s' is not registered here\n", call_id, from, to);
-			janus_audiocall_link_send_hangup(call_id, "User not found");
+			JANUS_LOG(LOG_WARN, "[AudioCall] Cross-server call %u from %s: '%s' is not registered here\n", call_id, caller_name, to);
+			janus_audiocall_link_send_hangup(from, call_id, "User not found");
 			return;
 		}
 		janus_refcount_increase(&callee->ref);
 		gboolean busy = (callee->peer != NULL) || !g_atomic_int_compare_and_exchange(&callee->incall, 0, 1);
 		janus_mutex_unlock(&sessions_mutex);
 		if(busy) {
-			JANUS_LOG(LOG_INFO, "[AudioCall] Cross-server call %u from %s: '%s' is busy\n", call_id, from, to);
-			janus_audiocall_link_send_hangup(call_id, "User busy");
+			JANUS_LOG(LOG_INFO, "[AudioCall] Cross-server call %u from %s: '%s' is busy\n", call_id, caller_name, to);
+			janus_audiocall_link_send_hangup(from, call_id, "User busy");
 			janus_refcount_decrease(&callee->ref);
 			return;
 		}
@@ -854,93 +1016,116 @@ static void janus_audiocall_link_handle(json_t *msg) {
 			janus_refcount_decrease(&existing->ref);
 			g_atomic_int_set(&callee->incall, 0);
 			janus_refcount_decrease(&callee->ref);
-			janus_audiocall_link_send_hangup(call_id, "Call id already in use, please retry");
+			janus_audiocall_link_send_hangup(from, call_id, "Call id already in use, please retry");
 			return;
 		}
-		janus_audiocall_remote_add(callee, call_id, from);
+		janus_audiocall_remote_add(callee, call_id, caller_name, from, name);
 		callee->has_audio = TRUE;
 		callee->has_video = FALSE;
 		callee->has_data = FALSE;
 		g_atomic_int_set(&callee->hangingup, 0);
-		JANUS_LOG(LOG_INFO, "[AudioCall] Incoming cross-server call %u: %s (peer server) -> %s\n", call_id, from, to);
+		JANUS_LOG(LOG_INFO, "[AudioCall] Incoming cross-server call %u: %s (server '%s') -> %s\n",
+			call_id, caller_name, name ? name : "?", to);
 		json_t *result = json_object();
 		json_object_set_new(result, "event", json_string("incomingcall"));
-		json_object_set_new(result, "username", json_string(from));
+		json_object_set_new(result, "username", json_string(caller_name));
 		json_object_set_new(result, "remote", json_true());
 		janus_audiocall_push_result(callee, result, json_pack("{ssss}", "type", sdp_type, "sdp", sdp));
 		janus_refcount_decrease(&callee->ref);
-	} else if(!strcmp(type, "accepted")) {
-		/* The peer server's user answered a call made by one of OUR users */
+	} else if(!strcmp(type, "accepted") || !strcmp(type, "hangup")) {
 		guint32 call_id = (guint32)json_integer_value(json_object_get(msg, "call_id"));
-		const char *sdp_type = json_string_value(json_object_get(msg, "sdp_type"));
-		const char *sdp = json_string_value(json_object_get(msg, "sdp"));
-		janus_audiocall_session *caller = janus_audiocall_remote_get(call_id);
-		if(caller == NULL) {
-			janus_audiocall_link_send_hangup(call_id, "Unknown call");
-			return;
-		}
-		if(sdp_type == NULL || sdp == NULL) {
-			janus_audiocall_remote_hangup_local(caller, "Peer answered without SDP");
-			janus_audiocall_link_send_hangup(call_id, "Missing SDP");
-			janus_refcount_decrease(&caller->ref);
-			return;
-		}
-		janus_mutex_lock(&caller->mutex);
-		char *remote_user = g_strdup(caller->remote_username ? caller->remote_username : "");
-		janus_mutex_unlock(&caller->mutex);
-		JANUS_LOG(LOG_INFO, "[AudioCall] Cross-server call %u: %s accepted the call from %s\n", call_id, remote_user, caller->username);
-		json_t *result = json_object();
-		json_object_set_new(result, "event", json_string("accepted"));
-		json_object_set_new(result, "username", json_string(remote_user));
-		janus_audiocall_push_result(caller, result, json_pack("{ssss}", "type", sdp_type, "sdp", sdp));
-		g_free(remote_user);
-		janus_refcount_decrease(&caller->ref);
-	} else if(!strcmp(type, "hangup")) {
-		/* The peer server ended (or refused) a cross-server call */
-		guint32 call_id = (guint32)json_integer_value(json_object_get(msg, "call_id"));
-		const char *reason = json_string_value(json_object_get(msg, "reason"));
 		janus_audiocall_session *session = janus_audiocall_remote_get(call_id);
-		if(session == NULL)
+		if(session == NULL) {
+			if(!strcmp(type, "accepted"))
+				janus_audiocall_link_send_hangup(from, call_id, "Unknown call");
 			return;
-		JANUS_LOG(LOG_INFO, "[AudioCall] Cross-server call %u ended by the peer server: %s\n", call_id, reason ? reason : "?");
-		janus_audiocall_remote_hangup_local(session, reason ? reason : "Remote hangup");
+		}
+		/* Only the server the call was set up with can answer or end it */
+		janus_mutex_lock(&session->mutex);
+		gboolean ok = (session->remote_addr.sin_addr.s_addr == from->sin_addr.s_addr);
+		char *remote_user = g_strdup(session->remote_username ? session->remote_username : "");
+		janus_mutex_unlock(&session->mutex);
+		if(!ok) {
+			JANUS_LOG(LOG_WARN, "[AudioCall] Ignoring '%s' for call %u from unexpected address %s\n", type, call_id,
+				janus_audiocall_addr_str(from, addr, sizeof(addr)));
+		} else if(!strcmp(type, "accepted")) {
+			/* The other server's user answered a call made by one of OUR users */
+			const char *sdp_type = json_string_value(json_object_get(msg, "sdp_type"));
+			const char *sdp = json_string_value(json_object_get(msg, "sdp"));
+			if(sdp_type == NULL || sdp == NULL) {
+				janus_audiocall_remote_hangup_local(session, "Peer answered without SDP");
+				janus_audiocall_link_send_hangup(from, call_id, "Missing SDP");
+			} else {
+				JANUS_LOG(LOG_INFO, "[AudioCall] Cross-server call %u: %s accepted the call from %s\n", call_id, remote_user, session->username);
+				json_t *result = json_object();
+				json_object_set_new(result, "event", json_string("accepted"));
+				json_object_set_new(result, "username", json_string(remote_user));
+				janus_audiocall_push_result(session, result, json_pack("{ssss}", "type", sdp_type, "sdp", sdp));
+			}
+		} else {
+			/* The other server ended (or refused) a cross-server call */
+			const char *reason = json_string_value(json_object_get(msg, "reason"));
+			JANUS_LOG(LOG_INFO, "[AudioCall] Cross-server call %u ended by server '%s': %s\n", call_id, name ? name : "?", reason ? reason : "?");
+			janus_audiocall_remote_hangup_local(session, reason ? reason : "Remote hangup");
+		}
+		g_free(remote_user);
 		janus_refcount_decrease(&session->ref);
 	} else {
-		JANUS_LOG(LOG_WARN, "[AudioCall] Unknown peer link message type '%s'\n", type);
+		JANUS_LOG(LOG_WARN, "[AudioCall] Unknown link message type '%s' from %s\n", type,
+			janus_audiocall_addr_str(from, addr, sizeof(addr)));
 	}
 }
 
-/* Thread that receives peer link messages and sends keep-alives */
+/* Drop the servers we haven't heard from for a while, and end our calls with them */
+static void janus_audiocall_link_expire_peers(void) {
+	gint64 now = g_get_monotonic_time();
+	GList *gone = NULL;
+	janus_mutex_lock(&link_mutex);
+	GHashTableIter iter;
+	gpointer value;
+	g_hash_table_iter_init(&iter, link_peers);
+	while(g_hash_table_iter_next(&iter, NULL, &value)) {
+		janus_audiocall_peer *peer = value;
+		if(now - peer->last_seen > JANUS_AUDIOCALL_LINK_DEAD_AFTER) {
+			gone = g_list_prepend(gone, g_strdup(peer->name));
+			g_hash_table_iter_remove(&iter);	/* Frees the peer */
+		}
+	}
+	janus_mutex_unlock(&link_mutex);
+	GList *temp = gone;
+	while(temp) {
+		JANUS_LOG(LOG_WARN, "[AudioCall] Server '%s' is gone: no announcements for %d seconds\n",
+			(char *)temp->data, (int)(JANUS_AUDIOCALL_LINK_DEAD_AFTER / G_TIME_SPAN_SECOND));
+		janus_audiocall_remote_end_peer((char *)temp->data, "Peer server unreachable");
+		g_atomic_int_set(&link_online_dirty, 1);
+		temp = temp->next;
+	}
+	g_list_free_full(gone, g_free);
+}
+
+/* Thread that announces this server, receives link messages and relays cross-server media */
 static void *janus_audiocall_link_thread(void *data) {
-	JANUS_LOG(LOG_INFO, "[AudioCall] Peer link thread started: listening on UDP %d, peer is %s:%d\n",
-		link_local_port, link_peer_host, link_peer_port);
+	JANUS_LOG(LOG_INFO, "[AudioCall] Link thread started: UDP %d, finding other servers by broadcast\n", link_local_port);
 	static char buffer[65536];	/* SDPs can be bigger than one Ethernet frame */
-	gint64 last_ping = 0;
+	gint64 last_hello = 0;
 	while(g_atomic_int_get(&initialized) && !g_atomic_int_get(&stopping)) {
 		gint64 now = g_get_monotonic_time();
-		if(now - last_ping >= JANUS_AUDIOCALL_LINK_PING_EVERY) {
-			last_ping = now;
-			json_t *ping = json_object();
-			json_object_set_new(ping, "type", json_string("ping"));
-			json_object_set_new(ping, "server", json_string(link_server_name));
-			janus_audiocall_link_send(ping);
-			json_decref(ping);
-			janus_mutex_lock(&link_mutex);
-			gint64 last_seen = link_last_seen;
-			janus_mutex_unlock(&link_mutex);
-			if(g_atomic_int_get(&link_peer_up) && now - last_seen > JANUS_AUDIOCALL_LINK_DEAD_AFTER) {
-				g_atomic_int_set(&link_peer_up, 0);
-				JANUS_LOG(LOG_WARN, "[AudioCall] Peer link DOWN: no messages from %s:%d for %d seconds\n",
-					link_peer_host, link_peer_port, (int)(JANUS_AUDIOCALL_LINK_DEAD_AFTER / G_TIME_SPAN_SECOND));
-				janus_audiocall_remote_end_all("Peer server unreachable");
-			}
+		gboolean dirty = g_atomic_int_compare_and_exchange(&link_dirty, 1, 0);
+		if(dirty || now - last_hello >= JANUS_AUDIOCALL_LINK_HELLO_EVERY) {
+			last_hello = now;
+			janus_audiocall_link_announce();
+			janus_audiocall_link_expire_peers();
+			if(dirty)
+				g_atomic_int_set(&link_online_dirty, 1);
 		}
+		if(g_atomic_int_compare_and_exchange(&link_online_dirty, 1, 0))
+			janus_audiocall_push_online(FALSE);
 		struct pollfd pfd = { .fd = link_fd, .events = POLLIN, .revents = 0 };
-		int res = poll(&pfd, 1, 500);
+		int res = poll(&pfd, 1, 200);
 		if(res < 0) {
 			if(errno == EINTR)
 				continue;
-			JANUS_LOG(LOG_ERR, "[AudioCall] Peer link poll error: %s\n", g_strerror(errno));
+			JANUS_LOG(LOG_ERR, "[AudioCall] Link poll error: %s\n", g_strerror(errno));
 			break;
 		}
 		if(res == 0 || !(pfd.revents & POLLIN))
@@ -950,56 +1135,47 @@ static void *janus_audiocall_link_thread(void *data) {
 		ssize_t len = recvfrom(link_fd, buffer, sizeof(buffer) - 1, 0, (struct sockaddr *)&from, &fromlen);
 		if(len <= 0)
 			continue;
-		if(from.sin_addr.s_addr != link_peer_addr.sin_addr.s_addr) {
-			char addr[INET_ADDRSTRLEN];
-			JANUS_LOG(LOG_WARN, "[AudioCall] Ignoring peer link packet from unexpected address %s\n",
-				inet_ntop(AF_INET, &from.sin_addr, addr, sizeof(addr)) ? addr : "?");
-			continue;
-		}
-		if(buffer[0] == 'A' || buffer[0] == 'V') {
-			/* Media of a cross-server call: 'A'/'V' + call_id (4 bytes) + RTP packet */
-			if(len < 5 + 12)
+		if(buffer[0] == 'A' || buffer[0] == 'V' || buffer[0] == 'K') {
+			/* Media of a cross-server call: 'A'/'V' + call_id (4 bytes) + RTP packet,
+			 * or a keyframe request: 'K' + call_id */
+			gboolean keyframe = (buffer[0] == 'K');
+			if(len < (keyframe ? 5 : 5 + 12))
 				continue;
 			gboolean video = (buffer[0] == 'V');
 #ifndef IC_VIDEO
-			if(video)
+			if(video || keyframe)
 				continue;	/* the audio plugin never relays video */
 #endif
 			guint32 nid = 0;
 			memcpy(&nid, buffer + 1, sizeof(nid));
 			guint32 call_id = ntohl(nid);
 			janus_audiocall_session *session = janus_audiocall_remote_get(call_id);
-			if(session != NULL) {
-				if(!g_atomic_int_get(&session->destroyed) && !g_atomic_int_get(&session->hangingup)) {
-					/* First video packet of this call: ask the sender for a keyframe right away */
-					if(video && !session->remote_video_seen) {
-						session->remote_video_seen = TRUE;
-						janus_audiocall_link_send_keyframe_request(call_id);
-					}
-					janus_plugin_rtp packet;
-					janus_plugin_rtp_reset(&packet);
-					packet.mindex = -1;
-					packet.video = video;
-					packet.buffer = buffer + 5;
-					packet.length = (uint16_t)(len - 5);
-					gateway->relay_rtp(session->handle, &packet);
-				}
-				janus_refcount_decrease(&session->ref);
-			}
-			continue;
-		}
-		if(buffer[0] == 'K') {
-			/* The peer's user needs a keyframe: ask OUR user (the video sender) for one */
-			if(len < 5)
+			if(session == NULL)
 				continue;
-			guint32 nid = 0;
-			memcpy(&nid, buffer + 1, sizeof(nid));
-			janus_audiocall_session *session = janus_audiocall_remote_get(ntohl(nid));
-			if(session != NULL) {
-				if(!g_atomic_int_get(&session->destroyed) && !g_atomic_int_get(&session->hangingup))
-					gateway->send_pli(session->handle);
+			if(!janus_audiocall_same_addr(&session->remote_addr, &from) ||
+					g_atomic_int_get(&session->destroyed) || g_atomic_int_get(&session->hangingup)) {
+				/* Not from the server this call is with (or the call is ending): drop it */
 				janus_refcount_decrease(&session->ref);
+				continue;
 			}
+			if(keyframe) {
+				/* The other server's user needs a keyframe: ask OUR user (the video sender) for one */
+				gateway->send_pli(session->handle);
+			} else {
+				/* First video packet of this call: ask the sender for a keyframe right away */
+				if(video && !session->remote_video_seen) {
+					session->remote_video_seen = TRUE;
+					janus_audiocall_link_send_keyframe_request(&from, call_id);
+				}
+				janus_plugin_rtp packet;
+				janus_plugin_rtp_reset(&packet);
+				packet.mindex = -1;
+				packet.video = video;
+				packet.buffer = buffer + 5;
+				packet.length = (uint16_t)(len - 5);
+				gateway->relay_rtp(session->handle, &packet);
+			}
+			janus_refcount_decrease(&session->ref);
 			continue;
 		}
 		buffer[len] = '\0';
@@ -1008,39 +1184,34 @@ static void *janus_audiocall_link_thread(void *data) {
 		json_error_t jerror;
 		json_t *msg = json_loads(buffer, 0, &jerror);
 		if(msg == NULL) {
-			JANUS_LOG(LOG_WARN, "[AudioCall] Invalid JSON on peer link: %s\n", jerror.text);
+			JANUS_LOG(LOG_WARN, "[AudioCall] Invalid JSON on the link: %s\n", jerror.text);
 			continue;
 		}
-		janus_audiocall_link_handle(msg);
+		janus_audiocall_link_handle(msg, &from);
 		json_decref(msg);
 	}
-	JANUS_LOG(LOG_INFO, "[AudioCall] Peer link thread stopped\n");
+	JANUS_LOG(LOG_INFO, "[AudioCall] Link thread stopped\n");
 	return NULL;
 }
 
-/* Create and bind the peer link UDP socket */
+/* Create and bind the link UDP socket (broadcast enabled) */
 static int janus_audiocall_link_setup(void) {
-	memset(&link_peer_addr, 0, sizeof(link_peer_addr));
-	link_peer_addr.sin_family = AF_INET;
-	link_peer_addr.sin_port = htons(link_peer_port);
-	if(inet_pton(AF_INET, link_peer_host, &link_peer_addr.sin_addr) != 1) {
-		JANUS_LOG(LOG_ERR, "[AudioCall] peer_host '%s' is not a valid IPv4 address\n", link_peer_host);
-		return -1;
-	}
 	link_fd = socket(AF_INET, SOCK_DGRAM, 0);
 	if(link_fd < 0) {
-		JANUS_LOG(LOG_ERR, "[AudioCall] Couldn't create the peer link socket: %s\n", g_strerror(errno));
+		JANUS_LOG(LOG_ERR, "[AudioCall] Couldn't create the link socket: %s\n", g_strerror(errno));
 		return -1;
 	}
 	int yes = 1;
 	setsockopt(link_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+	if(setsockopt(link_fd, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes)) < 0)
+		JANUS_LOG(LOG_WARN, "[AudioCall] Couldn't enable broadcast on the link socket: %s\n", g_strerror(errno));
 	struct sockaddr_in local;
 	memset(&local, 0, sizeof(local));
 	local.sin_family = AF_INET;
 	local.sin_port = htons(link_local_port);
 	local.sin_addr.s_addr = htonl(INADDR_ANY);
 	if(bind(link_fd, (struct sockaddr *)&local, sizeof(local)) < 0) {
-		JANUS_LOG(LOG_ERR, "[AudioCall] Couldn't bind the peer link to UDP port %d: %s\n", link_local_port, g_strerror(errno));
+		JANUS_LOG(LOG_ERR, "[AudioCall] Couldn't bind the link to UDP port %d: %s\n", link_local_port, g_strerror(errno));
 		close(link_fd);
 		link_fd = -1;
 		return -1;
@@ -1086,17 +1257,18 @@ int janus_audiocall_init(janus_callbacks *callback, const char *config_path) {
 		item = janus_config_get(config, config_general, janus_config_type_item, "link_port");
 		if(item != NULL && item->value != NULL && janus_string_to_uint16(item->value, &link_local_port) < 0)
 			JANUS_LOG(LOG_WARN, "[AudioCall] Invalid link_port '%s', using %d\n", item->value, link_local_port);
-		item = janus_config_get(config, config_general, janus_config_type_item, "peer_port");
-		if(item != NULL && item->value != NULL && janus_string_to_uint16(item->value, &link_peer_port) < 0)
-			JANUS_LOG(LOG_WARN, "[AudioCall] Invalid peer_port '%s', using %d\n", item->value, link_peer_port);
-		item = janus_config_get(config, config_general, janus_config_type_item, "peer_host");
-		if(item != NULL && item->value != NULL && strlen(item->value) > 0) {
-			link_peer_host = g_strdup(item->value);
-			link_enabled = TRUE;
+		item = janus_config_get(config, config_general, janus_config_type_item, "ws_port");
+		if(item != NULL && item->value != NULL && janus_string_to_uint16(item->value, &link_ws_port) < 0)
+			JANUS_LOG(LOG_WARN, "[AudioCall] Invalid ws_port '%s', using %d\n", item->value, link_ws_port);
+		if(janus_config_get(config, config_general, janus_config_type_item, "peer_host") != NULL ||
+				janus_config_get(config, config_general, janus_config_type_item, "peer_port") != NULL) {
+			JANUS_LOG(LOG_WARN, "[AudioCall] peer_host/peer_port are no longer used (other servers are found automatically), ignoring them\n");
 		}
 	}
+	/* The link is on unless link_port is 0 */
+	link_enabled = (link_local_port != 0);
 	if(link_server_name == NULL)
-		link_server_name = g_strdup("audiocall");
+		link_server_name = g_strdup(g_get_host_name());
 	janus_config_destroy(config);
 	config = NULL;
 
@@ -1122,10 +1294,9 @@ int janus_audiocall_init(janus_callbacks *callback, const char *config_path) {
 	}
 	/* IC: start the peer link, if configured */
 	if(!link_enabled) {
-		JANUS_LOG(LOG_INFO, "[AudioCall] No peer_host configured: peer link disabled, local calls only\n");
+		JANUS_LOG(LOG_INFO, "[AudioCall] link_port is 0: link disabled, local calls only\n");
 	} else {
-		link_replies = g_hash_table_new_full(NULL, NULL, NULL, (GDestroyNotify)json_decref);
-		janus_condition_init(&link_cond);
+		link_peers = g_hash_table_new_full(g_str_hash, g_str_equal, NULL, (GDestroyNotify)janus_audiocall_peer_free);
 		if(janus_audiocall_link_setup() < 0) {
 			JANUS_LOG(LOG_ERR, "[AudioCall] Peer link disabled, local calls only\n");
 			link_enabled = FALSE;
@@ -1166,19 +1337,16 @@ void janus_audiocall_destroy(void) {
 		link_fd = -1;
 	}
 	janus_mutex_lock(&link_mutex);
-	if(link_replies != NULL) {
-		g_hash_table_destroy(link_replies);
-		link_replies = NULL;
+	if(link_peers != NULL) {
+		g_hash_table_destroy(link_peers);
+		link_peers = NULL;
 	}
-	g_free(link_peer_name);
-	link_peer_name = NULL;
 	janus_mutex_unlock(&link_mutex);
-	g_free(link_peer_host);
-	link_peer_host = NULL;
+	free(link_last_online);
+	link_last_online = NULL;
 	g_free(link_server_name);
 	link_server_name = NULL;
 	link_enabled = FALSE;
-	g_atomic_int_set(&link_peer_up, 0);
 	janus_mutex_lock(&remote_calls_mutex);
 	if(remote_calls != NULL) {
 		g_hash_table_destroy(remote_calls);
@@ -1289,6 +1457,7 @@ void janus_audiocall_destroy_session(janus_plugin_session *handle, int *error) {
 	if(session->username != NULL) {
 		int res = g_hash_table_remove(usernames, (gpointer)session->username);
 		JANUS_LOG(LOG_VERB, "  -- Removed: %d\n", res);
+		g_atomic_int_set(&link_dirty, 1);	/* IC: tell the other servers */
 	}
 	g_hash_table_remove(sessions, handle);
 	janus_mutex_unlock(&sessions_mutex);
@@ -1422,10 +1591,10 @@ void janus_audiocall_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp
 				return;
 #ifdef IC_VIDEO
 			if(packet->video ? session->video_active : session->audio_active)
-				janus_audiocall_link_send_rtp(call_id, packet->video, packet->buffer, packet->length);
+				janus_audiocall_link_send_rtp(&session->remote_addr, call_id, packet->video, packet->buffer, packet->length);
 #else
 			if(!packet->video && session->audio_active)
-				janus_audiocall_link_send_rtp(call_id, FALSE, packet->buffer, packet->length);
+				janus_audiocall_link_send_rtp(&session->remote_addr, call_id, FALSE, packet->buffer, packet->length);
 #endif
 			return;
 		}
@@ -1533,7 +1702,7 @@ void janus_audiocall_incoming_rtcp(janus_plugin_session *handle, janus_plugin_rt
 					janus_rtcp_has_fir(packet->buffer, packet->length))) {
 				guint32 call_id = session->call_id;
 				if(call_id != 0)
-					janus_audiocall_link_send_keyframe_request(call_id);
+					janus_audiocall_link_send_keyframe_request(&session->remote_addr, call_id);
 			}
 #endif
 			return;
@@ -1695,10 +1864,11 @@ static void janus_audiocall_hangup_media_internal(janus_plugin_session *handle) 
 	g_atomic_int_set(&session->dataready, 0);
 	/* IC: if in a cross-server call, tell the peer server */
 	guint32 remote_call_id = 0;
-	if(janus_audiocall_remote_detach(session, &remote_call_id, NULL)) {
+	struct sockaddr_in remote_addr;
+	if(janus_audiocall_remote_detach(session, &remote_call_id, NULL, &remote_addr)) {
 		JANUS_LOG(LOG_INFO, "[AudioCall] Cross-server call %u ended: %s's PeerConnection went away\n",
 			remote_call_id, session->username ? session->username : "?");
-		janus_audiocall_link_send_hangup(remote_call_id, "Remote WebRTC hangup");
+		janus_audiocall_link_send_hangup(&remote_addr, remote_call_id, "Remote WebRTC hangup");
 	}
 	/* Get rid of the recorders, if available */
 	janus_mutex_lock(&session->rec_mutex);
@@ -1890,20 +2060,11 @@ static void *janus_audiocall_handler(void *data) {
 			json_object_set_new(result, "list", list);
 			janus_mutex_unlock(&sessions_mutex);
 			json_object_set_new(result, "server", json_string(link_server_name));
-			/* IC: also ask the peer server for its users */
+			/* IC: also the users of all the other servers we know of */
 			if(link_enabled) {
-				json_t *request = json_object();
-				json_object_set_new(request, "type", json_string("list"));
-				json_t *reply = janus_audiocall_link_request(request);
-				json_object_set_new(result, "peer_online", reply ? json_true() : json_false());
-				if(reply != NULL) {
-					json_t *users = json_object_get(reply, "users");
-					json_object_set_new(result, "peer_list", json_is_array(users) ? json_incref(users) : json_array());
-					const char *peer_server = json_string_value(json_object_get(reply, "server"));
-					if(peer_server != NULL)
-						json_object_set_new(result, "peer_server", json_string(peer_server));
-					json_decref(reply);
-				}
+				json_t *info = janus_audiocall_peer_info();
+				json_object_update(result, info);
+				json_decref(info);
 			}
 		} else if(!strcasecmp(request_text, "locate")) {
 			/* IC: tell the user where a username is registered */
@@ -1914,16 +2075,20 @@ static void *janus_audiocall_handler(void *data) {
 				goto error;
 			const char *username_text = json_string_value(json_object_get(root, "username"));
 			const char *where = "none";
+			char *where_server = NULL;
 			if(janus_audiocall_is_local_user(username_text)) {
 				where = "local";
-			} else if(link_enabled) {
-				int remote = janus_audiocall_link_lookup(username_text);
-				where = (remote == 1) ? "peer" : (remote < 0 ? "unknown (peer not reachable)" : "none");
+				where_server = g_strdup(link_server_name);
+			} else if(link_enabled && janus_audiocall_peer_find_user(username_text, NULL, &where_server)) {
+				where = "peer";
 			}
 			result = json_object();
 			json_object_set_new(result, "event", json_string("located"));
 			json_object_set_new(result, "username", json_string(username_text));
 			json_object_set_new(result, "where", json_string(where));
+			if(where_server != NULL)
+				json_object_set_new(result, "server", json_string(where_server));
+			g_free(where_server);
 		} else if(!strcasecmp(request_text, "register")) {
 			/* Map this handle to a username */
 			JANUS_VALIDATE_JSON_OBJECT(root, username_parameters,
@@ -1933,11 +2098,13 @@ static void *janus_audiocall_handler(void *data) {
 				goto error;
 			json_t *username = json_object_get(root, "username");
 			const char *username_text = json_string_value(username);
-			/* IC: a username can only be registered on one of the two servers */
-			if(session->username == NULL && link_enabled && janus_audiocall_link_lookup(username_text) == 1) {
-				JANUS_LOG(LOG_ERR, "Username '%s' already registered on the peer server\n", username_text);
+			/* IC: a username can only be registered on one server */
+			char *taken_on = NULL;
+			if(session->username == NULL && link_enabled && janus_audiocall_peer_find_user(username_text, NULL, &taken_on)) {
+				JANUS_LOG(LOG_ERR, "Username '%s' already registered on server '%s'\n", username_text, taken_on);
 				error_code = JANUS_AUDIOCALL_ERROR_USERNAME_TAKEN;
-				g_snprintf(error_cause, 512, "Username '%s' is already registered on the peer server", username_text);
+				g_snprintf(error_cause, 512, "Username '%s' is already registered on server '%s'", username_text, taken_on);
+				g_free(taken_on);
 				goto error;
 			}
 			janus_mutex_lock(&sessions_mutex);
@@ -1959,6 +2126,7 @@ static void *janus_audiocall_handler(void *data) {
 			janus_refcount_increase(&session->ref);
 			g_hash_table_insert(usernames, (gpointer)g_strdup(session->username), session);
 			janus_mutex_unlock(&sessions_mutex);
+			g_atomic_int_set(&link_dirty, 1);	/* IC: tell the other servers */
 			result = json_object();
 			json_object_set_new(result, "event", json_string("registered"));
 			json_object_set_new(result, "username", json_string(username_text));
@@ -2020,11 +2188,13 @@ static void *janus_audiocall_handler(void *data) {
 			if(peer == NULL || g_atomic_int_get(&peer->destroyed)) {
 				g_atomic_int_set(&session->incall, 0);
 				janus_mutex_unlock(&sessions_mutex);
-				/* IC: not registered here, is this user on the peer server? */
-				int remote = link_enabled ? janus_audiocall_link_lookup(username_text) : 0;
-				if(remote == 1) {
+				/* IC: not registered here, is this user on another server? */
+				struct sockaddr_in remote_addr;
+				char *remote_server = NULL;
+				if(link_enabled && janus_audiocall_peer_find_user(username_text, &remote_addr, &remote_server)) {
 					/* IC: start a cross-server call, the offer travels over the peer link */
 					if(msg_sdp == NULL || msg_sdp_type == NULL) {
+						g_free(remote_server);
 						JANUS_LOG(LOG_ERR, "Missing SDP\n");
 						error_code = JANUS_AUDIOCALL_ERROR_MISSING_SDP;
 						g_snprintf(error_cause, 512, "Missing SDP");
@@ -2041,7 +2211,7 @@ static void *janus_audiocall_handler(void *data) {
 						}
 					}
 					g_atomic_int_set(&session->incall, 1);
-					janus_audiocall_remote_add(session, call_id, username_text);
+					janus_audiocall_remote_add(session, call_id, username_text, &remote_addr, remote_server);
 					session->has_audio = TRUE;
 					session->has_video = FALSE;
 					session->has_data = FALSE;
@@ -2054,18 +2224,19 @@ static void *janus_audiocall_handler(void *data) {
 					json_object_set_new(call, "sdp_type", json_string(msg_sdp_type));
 					json_object_set_new(call, "sdp", json_string(msg_sdp));
 					json_object_set_new(call, "server", json_string(link_server_name));
-					janus_audiocall_link_send(call);
+					janus_audiocall_link_send_to(&remote_addr, call);
 					json_decref(call);
-					JANUS_LOG(LOG_INFO, "[AudioCall] Cross-server call %u: %s -> %s (on the peer server)\n",
-						call_id, session->username, username_text);
+					JANUS_LOG(LOG_INFO, "[AudioCall] Cross-server call %u: %s -> %s (on server '%s')\n",
+						call_id, session->username, username_text, remote_server);
+					g_free(remote_server);
 					result = json_object();
 					json_object_set_new(result, "event", json_string("calling"));
 					json_object_set_new(result, "remote", json_true());
 					goto request_done;
 				}
-				JANUS_LOG(LOG_ERR, "Username '%s' doesn't exist%s\n", username_text, remote < 0 ? " (peer server not reachable)" : "");
+				JANUS_LOG(LOG_ERR, "Username '%s' doesn't exist\n", username_text);
 				error_code = JANUS_AUDIOCALL_ERROR_NO_SUCH_USERNAME;
-				g_snprintf(error_cause, 512, "Username '%s' doesn't exist%s", username_text, remote < 0 ? " (peer server not reachable)" : "");
+				g_snprintf(error_cause, 512, "Username '%s' doesn't exist", username_text);
 				/* Hangup the call attempt of the user */
 				gateway->close_pc(session->handle);
 				goto error;
@@ -2193,6 +2364,7 @@ static void *janus_audiocall_handler(void *data) {
 				janus_mutex_lock(&session->mutex);
 				guint32 call_id = session->call_id;
 				char *remote_user = g_strdup(session->remote_username ? session->remote_username : "");
+				struct sockaddr_in remote_addr = session->remote_addr;
 				janus_mutex_unlock(&session->mutex);
 				json_t *accepted = json_object();
 				json_object_set_new(accepted, "type", json_string("accepted"));
@@ -2200,7 +2372,7 @@ static void *janus_audiocall_handler(void *data) {
 				json_object_set_new(accepted, "sdp_type", json_string(msg_sdp_type));
 				json_object_set_new(accepted, "sdp", json_string(msg_sdp));
 				json_object_set_new(accepted, "server", json_string(link_server_name));
-				janus_audiocall_link_send(accepted);
+				janus_audiocall_link_send_to(&remote_addr, accepted);
 				json_decref(accepted);
 				JANUS_LOG(LOG_INFO, "[AudioCall] Cross-server call %u: %s accepted the call from %s\n",
 					call_id, session->username, remote_user);
@@ -2634,9 +2806,10 @@ static void *janus_audiocall_handler(void *data) {
 			if(session->remote_call) {
 				guint32 call_id = 0;
 				char *remote_user = NULL;
-				if(janus_audiocall_remote_detach(session, &call_id, &remote_user)) {
+				struct sockaddr_in remote_addr;
+				if(janus_audiocall_remote_detach(session, &call_id, &remote_user, &remote_addr)) {
 					JANUS_LOG(LOG_INFO, "[AudioCall] Cross-server call %u: %s hung up (%s)\n", call_id, session->username, hangup_text);
-					janus_audiocall_link_send_hangup(call_id, hangup_text);
+					janus_audiocall_link_send_hangup(&remote_addr, call_id, hangup_text);
 				}
 				result = json_object();
 				json_object_set_new(result, "event", json_string("hangup"));
