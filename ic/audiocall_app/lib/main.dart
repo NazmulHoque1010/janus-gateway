@@ -1,7 +1,19 @@
 // IC Call app
 //
-// Audio and video calls through the IC Janus servers (PC1 and PC2), over the
-// Janus WebSocket API. No FreeSWITCH and no SIP.
+// Audio and video calls through the IC Janus servers, over the Janus
+// WebSocket API. No FreeSWITCH and no SIP.
+//
+// No registration screen and no server addresses: the username is set when
+// the app is built, and on start the app
+//   1. broadcasts {"type":"discover"} on the LAN (UDP 7088),
+//   2. collects the answers of the Janus servers (name + how many users),
+//   3. joins the server with the FEWEST users (random pick on a tie),
+//   4. registers the username on both plugins.
+// The online users of every server are pushed by the plugin ("online" events).
+//
+//   flutter run -d <phone>  --dart-define=IC_USER=Nazmul
+//   flutter run -d linux    --dart-define=IC_USER=Sazid
+// Optional, if the network blocks broadcasts: --dart-define=IC_SEED=<IP of any Janus>
 //
 //   Audio calls: custom janus.plugin.audiocall plugin. Audio only (no camera).
 //   Video calls: custom janus.plugin.customvideocall plugin (built from the
@@ -16,6 +28,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
@@ -26,19 +39,25 @@ void main() {
   runApp(const ICCallApp());
 }
 
-/// The Janus servers of the IC setup.
-class ServerPreset {
-  const ServerPreset(this.name, this.host);
+/// This app's username, set at build time: --dart-define=IC_USER=Nazmul
+const String kUsername = String.fromEnvironment('IC_USER');
+
+/// Optional: the IP of one Janus server to ask directly, for networks that
+/// block broadcasts: --dart-define=IC_SEED=192.168.97.135
+const String kSeedServer = String.fromEnvironment('IC_SEED');
+
+/// UDP port the AudioCall plugin answers "discover" on (its link port).
+const int kDiscoveryPort = 7088;
+
+/// A Janus server that answered our "discover".
+class FoundServer {
+  const FoundServer(this.name, this.host, this.port, this.users);
 
   final String name;
   final String host;
+  final int port;
+  final int users;
 }
-
-const List<ServerPreset> kServers = [
-  ServerPreset('PC1', '192.168.97.135'),
-  ServerPreset('PC2', '192.168.99.112'),
-];
-const String kJanusPort = '8188';
 const String kAudioPlugin = 'janus.plugin.audiocall';
 const String kVideoPlugin = 'janus.plugin.customvideocall';
 
@@ -83,21 +102,21 @@ class _CallPageState extends State<CallPage> {
   // Settings
   // ---------------------------------------------------------------------------
 
-  final TextEditingController _hostController =
-      TextEditingController(text: kServers.first.host);
-  final TextEditingController _portController =
-      TextEditingController(text: kJanusPort);
-  final TextEditingController _usernameController = TextEditingController();
   final TextEditingController _destinationController = TextEditingController();
 
-  /// 'PC1', 'PC2' or 'Custom'.
-  String _serverChoice = kServers.first.name;
+  /// The Janus server we were placed on (found by discovery).
+  String? _janusHost;
+  int _janusPort = 8188;
+  String? _assignedServer;
+  String _serversSummary = '';
+  Timer? _reconnectTimer;
+  bool _disposed = false;
 
   // ---------------------------------------------------------------------------
   // Registration and call state
   // ---------------------------------------------------------------------------
 
-  String _status = 'Choose a server, enter your username and register.';
+  String _status = 'Starting...';
   bool _isRegistering = false;
   bool _isRegistered = false;
   bool _videoAvailable = false; // registered on the CustomVideoCall plugin too
@@ -123,10 +142,9 @@ class _CallPageState extends State<CallPage> {
 
   // Online users, from the AudioCall plugin's "list" request
   String? _thisServerName;
-  String? _peerServerName;
-  bool? _peerOnline; // null = peer link not configured
   List<String> _localUsers = [];
-  List<String> _peerUsers = [];
+  List<String> _peerUsers = []; // users on all the other servers
+  List<MapEntry<String, List<String>>> _otherServers = []; // server -> users
 
   // ---------------------------------------------------------------------------
   // Janus WebSocket transport
@@ -134,7 +152,7 @@ class _CallPageState extends State<CallPage> {
 
   int? _sessionId;
   int? _audioHandleId; // janus.plugin.audiocall
-  int? _videoHandleId; // janus.plugin.videocall
+  int? _videoHandleId; // janus.plugin.customvideocall
   WebSocket? _socket;
   StreamSubscription<dynamic>? _socketSub;
   Timer? _keepAliveTimer;
@@ -156,7 +174,7 @@ class _CallPageState extends State<CallPage> {
   bool get _isMobile => Platform.isAndroid || Platform.isIOS;
 
   String get _janusWsUrl =>
-      'ws://${_hostController.text.trim()}:${_portController.text.trim()}';
+      _janusHost == null ? '-' : 'ws://$_janusHost:$_janusPort';
 
   String get _platformName => Platform.isAndroid
       ? 'Android'
@@ -173,15 +191,16 @@ class _CallPageState extends State<CallPage> {
     super.initState();
     _localRenderer.initialize();
     _remoteRenderer.initialize();
+    // Register automatically as soon as the app is open
+    WidgetsBinding.instance.addPostFrameCallback((_) => _autoStart());
   }
 
   @override
   void dispose() {
+    _disposed = true;
     _callTimer?.cancel();
     _keepAliveTimer?.cancel();
-    _hostController.dispose();
-    _portController.dispose();
-    _usernameController.dispose();
+    _reconnectTimer?.cancel();
     _destinationController.dispose();
     unawaited(_disposeWebRtc().then((_) {
       _localRenderer.dispose();
@@ -284,8 +303,9 @@ class _CallPageState extends State<CallPage> {
       _audioHandleId = null;
       _videoHandleId = null;
       _phase = CallPhase.idle;
-      _status = '$reason Register again.';
+      _status = '$reason Reconnecting...';
     });
+    _scheduleReconnect(3);
   }
 
   void _failRegistrations(String reason) {
@@ -439,21 +459,94 @@ class _CallPageState extends State<CallPage> {
     return handleId;
   }
 
-  Future<void> _register() async {
-    if (_isRegistering) return;
-    final username = _usernameController.text.trim();
-    if (username.isEmpty) {
-      _setStatus('Enter a username (for example 1000) first.');
+  /// Called once when the app opens.
+  Future<void> _autoStart() async {
+    if (kUsername.isEmpty) {
+      _setStatus('No username set. Build the app with '
+          '--dart-define=IC_USER=<name>, for example: '
+          'flutter run --dart-define=IC_USER=Nazmul');
       return;
     }
+    await _discoverAndRegister();
+  }
+
+  /// Asks the LAN which Janus servers exist: broadcasts {"type":"discover"}
+  /// and collects the {"type":"here"} answers for about 1.5 seconds.
+  Future<List<FoundServer>> _discoverServers() async {
+    final socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+    socket.broadcastEnabled = true;
+    final found = <String, FoundServer>{};
+    final subscription = socket.listen((event) {
+      if (event != RawSocketEvent.read) return;
+      final datagram = socket.receive();
+      if (datagram == null) return;
+      try {
+        final m = jsonDecode(utf8.decode(datagram.data));
+        if (m is Map && m['type'] == 'here') {
+          final host = datagram.address.address;
+          final name = (m['server'] ?? host).toString();
+          found[name] = FoundServer(
+            name,
+            host,
+            (m['ws_port'] as num?)?.toInt() ?? 8188,
+            (m['users'] as num?)?.toInt() ?? 0,
+          );
+        }
+      } catch (_) {}
+    });
+
+    final request = utf8.encode(jsonEncode({'type': 'discover'}));
+    final targets = <InternetAddress>[InternetAddress('255.255.255.255')];
+    if (kSeedServer.isNotEmpty) {
+      final seed = InternetAddress.tryParse(kSeedServer);
+      if (seed != null) targets.add(seed);
+    }
+    // Sent twice: Wi-Fi can lose a broadcast
+    for (var i = 0; i < 2; i++) {
+      for (final target in targets) {
+        try {
+          socket.send(request, target, kDiscoveryPort);
+        } catch (error) {
+          print('DISCOVER SEND ERROR ($target): $error');
+        }
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 500));
+    await subscription.cancel();
+    socket.close();
+    print('DISCOVER: ${found.values.map((s) => '${s.name}@${s.host}=${s.users}').join(', ')}');
+    return found.values.toList();
+  }
+
+  /// The server with the fewest users; a random one of them on a tie.
+  FoundServer _pickServer(List<FoundServer> servers) {
+    final fewest = servers.map((s) => s.users).reduce(min);
+    final candidates = servers.where((s) => s.users == fewest).toList();
+    return candidates[Random().nextInt(candidates.length)];
+  }
+
+  void _scheduleReconnect(int seconds) {
+    _reconnectTimer?.cancel();
+    if (_disposed || kUsername.isEmpty) return;
+    _reconnectTimer = Timer(Duration(seconds: seconds), () {
+      unawaited(_discoverAndRegister());
+    });
+  }
+
+  /// Find the servers, join the least busy one and register on both plugins.
+  /// Retries every 5 seconds until it works.
+  Future<void> _discoverAndRegister() async {
+    if (_isRegistering || _isRegistered || _disposed || !mounted) return;
+    _reconnectTimer?.cancel();
+    final username = kUsername;
 
     setState(() {
       _isRegistering = true;
-      _isRegistered = false;
       _videoAvailable = false;
       _registeredAs = null;
       _phase = CallPhase.idle;
-      _status = 'Connecting...';
+      _status = 'Looking for Janus servers on the network...';
     });
 
     try {
@@ -463,9 +556,22 @@ class _CallPageState extends State<CallPage> {
       _audioHandleId = null;
       _videoHandleId = null;
 
+      final servers = await _discoverServers();
+      if (servers.isEmpty) {
+        throw Exception('no Janus server answered on the network');
+      }
+      final pick = _pickServer(servers);
+      _serversSummary = servers
+          .map((s) => '${s.name}: ${s.users} user${s.users == 1 ? '' : 's'}')
+          .join(', ');
+      _janusHost = pick.host;
+      _janusPort = pick.port;
+      _assignedServer = pick.name;
+      _setStatus('Found $_serversSummary. Joining ${pick.name}...');
+
       await _connectWebSocket();
 
-      _setStatus('Creating Janus session...');
+      _setStatus('Creating Janus session on ${pick.name}...');
       final created = await _request({'janus': 'create'}, needSession: false);
       _sessionId = (created['data'] as Map)['id'] as int;
       _startKeepAlive();
@@ -489,41 +595,21 @@ class _CallPageState extends State<CallPage> {
       setState(() {
         _isRegistered = true;
         _registeredAs = username;
-        _status = 'Registered as $username on $_serverChoice. '
+        _status = 'Registered as $username on ${pick.name} '
+            '(servers found: $_serversSummary). '
             'Ready for audio${_videoAvailable ? ' and video' : ''} calls.'
             '$videoNote';
       });
       unawaited(_refreshUsers());
-    } on TimeoutException {
-      _setStatus('Registration timed out.');
-      await _closeWebSocket();
     } catch (error) {
       print('REGISTER ERROR: $error');
-      _setStatus('Registration failed: $error');
+      _setStatus('Could not register as $username: $error. Retrying in 5 s...');
       await _closeWebSocket();
+      _sessionId = null;
+      _scheduleReconnect(5);
     } finally {
       if (mounted) setState(() => _isRegistering = false);
     }
-  }
-
-  Future<void> _disconnect() async {
-    if (_phase != CallPhase.idle) await _hangup();
-    // Destroying the session removes our username from both plugins
-    _sendNoWait({'janus': 'destroy'});
-    await _closeWebSocket();
-    if (!mounted) return;
-    setState(() {
-      _isRegistered = false;
-      _videoAvailable = false;
-      _registeredAs = null;
-      _sessionId = null;
-      _audioHandleId = null;
-      _videoHandleId = null;
-      _localUsers = [];
-      _peerUsers = [];
-      _peerOnline = null;
-      _status = 'Disconnected.';
-    });
   }
 
   Future<void> _refreshUsers() async {
@@ -668,9 +754,12 @@ class _CallPageState extends State<CallPage> {
     setState(() {
       _thisServerName = r['server']?.toString();
       _localUsers = toList(r['list']);
-      _peerOnline = r['peer_online'] is bool ? r['peer_online'] as bool : null;
-      _peerServerName = r['peer_server']?.toString();
       _peerUsers = toList(r['peer_list']);
+      _otherServers = [
+        if (r['servers'] is List)
+          for (final s in r['servers'] as List)
+            if (s is Map) MapEntry(s['server'].toString(), toList(s['users'])),
+      ];
     });
   }
 
@@ -1117,15 +1206,6 @@ class _CallPageState extends State<CallPage> {
   // UI
   // ---------------------------------------------------------------------------
 
-  void _selectServer(String choice) {
-    setState(() {
-      _serverChoice = choice;
-      for (final server in kServers) {
-        if (server.name == choice) _hostController.text = server.host;
-      }
-    });
-  }
-
   String _formatDuration(Duration d) {
     final minutes = d.inMinutes.remainder(60).toString().padLeft(2, '0');
     final seconds = d.inSeconds.remainder(60).toString().padLeft(2, '0');
@@ -1165,76 +1245,28 @@ class _CallPageState extends State<CallPage> {
     );
   }
 
-  Widget _buildServerCard() {
-    final locked = _isRegistered || _isRegistering;
+  /// Shown until the app is registered.
+  Widget _buildConnectingCard() {
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
+        child: Row(
           children: [
-            Text('Janus server', style: Theme.of(context).textTheme.titleMedium),
-            const SizedBox(height: 8),
-            Wrap(
-              spacing: 8,
-              children: [
-                for (final name in [...kServers.map((s) => s.name), 'Custom'])
-                  ChoiceChip(
-                    label: Text(name),
-                    selected: _serverChoice == name,
-                    onSelected: locked ? null : (_) => _selectServer(name),
-                  ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  flex: 3,
-                  child: _input(
-                    _hostController,
-                    'Janus IP',
-                    keyboardType: TextInputType.url,
-                    enabled: !locked && _serverChoice == 'Custom',
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  flex: 2,
-                  child: _input(
-                    _portController,
-                    'WS port',
-                    keyboardType: TextInputType.number,
-                    enabled: !locked,
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            _input(
-              _usernameController,
-              'My username (e.g. 1000)',
-              enabled: !locked,
-            ),
-            const SizedBox(height: 12),
-            if (!_isRegistered)
-              FilledButton.icon(
-                onPressed: _isRegistering ? null : _register,
-                icon: _isRegistering
-                    ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Icon(Icons.login),
-                label: const Text('Register'),
-              )
-            else
-              OutlinedButton.icon(
-                onPressed: _phase == CallPhase.idle ? _disconnect : null,
-                icon: const Icon(Icons.logout),
-                label: Text('Disconnect ($_registeredAs)'),
+            if (_isRegistering || kUsername.isNotEmpty)
+              const SizedBox(
+                width: 24,
+                height: 24,
+                child: CircularProgressIndicator(strokeWidth: 3),
               ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Text(
+                kUsername.isEmpty
+                    ? 'No username set'
+                    : 'Connecting as $kUsername...',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+            ),
           ],
         ),
       ),
@@ -1282,21 +1314,20 @@ class _CallPageState extends State<CallPage> {
                 ),
               ],
             ),
-            Text('This server (${_thisServerName ?? _serverChoice}):'),
+            Text('This server (${_thisServerName ?? _assignedServer ?? '?'}):'),
             const SizedBox(height: 4),
             _buildUserChips(_localUsers, false),
             const SizedBox(height: 8),
-            if (_peerOnline == null)
-              const Text('Other server: peer link not configured',
+            if (_otherServers.isEmpty)
+              const Text('No other servers found right now',
                   style: TextStyle(color: Colors.grey))
-            else if (_peerOnline == false)
-              const Text('Other server: not reachable',
-                  style: TextStyle(color: Colors.red))
-            else ...[
-              Text('Other server (${_peerServerName ?? '?'}):'),
-              const SizedBox(height: 4),
-              _buildUserChips(_peerUsers, true),
-            ],
+            else
+              for (final server in _otherServers) ...[
+                Text('Server ${server.key}:'),
+                const SizedBox(height: 4),
+                _buildUserChips(server.value, true),
+                const SizedBox(height: 8),
+              ],
             const Divider(height: 24),
             _input(
               _destinationController,
@@ -1492,6 +1523,7 @@ class _CallPageState extends State<CallPage> {
             SelectableText(
               'Platform: $_platformName\n'
               'Janus: $_janusWsUrl (${_socket != null ? 'connected' : 'disconnected'})\n'
+              'Servers found: ${_serversSummary.isEmpty ? '-' : _serversSummary}\n'
               'Session: ${_sessionId ?? '-'}\n'
               'Audio handle: ${_audioHandleId ?? '-'}   '
               'Video handle: ${_videoHandleId ?? '-'}\n'
@@ -1519,7 +1551,9 @@ class _CallPageState extends State<CallPage> {
           if (_isRegistered)
             Padding(
               padding: const EdgeInsets.only(right: 16),
-              child: Center(child: Text('$_registeredAs @ $_serverChoice')),
+              child: Center(
+                child: Text('$_registeredAs @ ${_thisServerName ?? _assignedServer ?? '?'}'),
+              ),
             ),
         ],
       ),
@@ -1534,11 +1568,7 @@ class _CallPageState extends State<CallPage> {
                   _buildCallCard(),
                   const SizedBox(height: 12),
                 ],
-                _buildServerCard(),
-                if (_isRegistered) ...[
-                  const SizedBox(height: 12),
-                  _buildDialCard(),
-                ],
+                if (_isRegistered) _buildDialCard() else _buildConnectingCard(),
                 const SizedBox(height: 12),
                 _buildStatusCard(),
               ],
