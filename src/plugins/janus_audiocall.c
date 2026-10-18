@@ -500,9 +500,10 @@ static void janus_audiocall_message_free(janus_audiocall_message *msg) {
  * Nothing about other servers is configured. Every plugin listens on a UDP
  * port (link_port, the same on every server) and, every 2 seconds, broadcasts
  *   {"type":"hello","server":"pc1","users":["Nazmul"],"ws_port":8188}
- * on the LAN. Every server builds its table of servers from these
- * announcements: name, address and who is registered there. A server that
- * stays silent for 6 seconds is dropped from the table.
+ * on the LAN, and also sends it directly (unicast) to every server it already
+ * knows, because Wi-Fi delivers broadcasts unreliably. Every server builds its
+ * table of servers from these announcements: name, address and who is
+ * registered there. A server that stays silent for 8 seconds is dropped.
  *
  * Apps find the servers the same way: they broadcast {"type":"discover"}
  * and each server answers {"type":"here","server":...,"users":N,"ws_port":...}.
@@ -531,7 +532,7 @@ static GHashTable *link_peers = NULL;	/* name -> janus_audiocall_peer, protected
 static janus_mutex link_mutex = JANUS_MUTEX_INITIALIZER;
 
 #define JANUS_AUDIOCALL_LINK_HELLO_EVERY	(2 * G_TIME_SPAN_SECOND)
-#define JANUS_AUDIOCALL_LINK_DEAD_AFTER		(6 * G_TIME_SPAN_SECOND)
+#define JANUS_AUDIOCALL_LINK_DEAD_AFTER		(8 * G_TIME_SPAN_SECOND)
 
 /* IC: cross-server calls in progress on THIS server: call_id -> local session (the table holds a reference) */
 static GHashTable *remote_calls = NULL;
@@ -881,7 +882,7 @@ static void janus_audiocall_push_online(gboolean force) {
 	json_decref(info);
 }
 
-/* Broadcast our announcement on every LAN interface */
+/* Broadcast our announcement on every LAN interface, and send it to every known server directly */
 static void janus_audiocall_link_announce(void) {
 	if(link_fd < 0)
 		return;
@@ -921,6 +922,27 @@ static void janus_audiocall_link_announce(void) {
 		dst.sin_addr.s_addr = htonl(INADDR_BROADCAST);
 		sendto(link_fd, text, strlen(text), 0, (struct sockaddr *)&dst, sizeof(dst));
 	}
+	/* Unicast to the servers we already know: Wi-Fi may drop broadcasts, but it retries unicast */
+	GList *addrs = NULL;
+	janus_mutex_lock(&link_mutex);
+	if(link_peers != NULL) {
+		GHashTableIter iter;
+		gpointer value;
+		g_hash_table_iter_init(&iter, link_peers);
+		while(g_hash_table_iter_next(&iter, NULL, &value)) {
+			janus_audiocall_peer *peer = value;
+			struct sockaddr_in *copy = g_malloc(sizeof(struct sockaddr_in));
+			*copy = peer->addr;
+			addrs = g_list_prepend(addrs, copy);
+		}
+	}
+	janus_mutex_unlock(&link_mutex);
+	GList *temp = addrs;
+	while(temp) {
+		sendto(link_fd, text, strlen(text), 0, (struct sockaddr *)temp->data, sizeof(struct sockaddr_in));
+		temp = temp->next;
+	}
+	g_list_free_full(addrs, g_free);
 	free(text);
 }
 
