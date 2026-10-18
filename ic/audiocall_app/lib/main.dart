@@ -1,12 +1,17 @@
-// IC AudioCall app
+// IC Call app
 //
-// Audio-only calls through the IC Janus servers (PC1 and PC2), using the
-// custom janus.plugin.audiocall plugin over the Janus WebSocket API.
-// No FreeSWITCH and no SIP: each user registers with a username on its own
-// Janus server, and the two servers' plugins connect calls between them.
+// Audio and video calls through the IC Janus servers (PC1 and PC2), over the
+// Janus WebSocket API. No FreeSWITCH and no SIP.
 //
-// Runs on Android (flutter run on a phone) and on Linux (flutter run -d linux),
-// and interoperates with the browser test page (html/ic/audiocall-test.html).
+//   Audio calls: custom janus.plugin.audiocall plugin. Audio only (no camera).
+//   Video calls: custom janus.plugin.customvideocall plugin (built from the
+//                same source), with camera on/off and front/back switch.
+//   Both work between users on the same OR the other Janus server.
+//
+// One Janus session holds two plugin handles (audio + video); the username is
+// registered on both. Only one call (audio or video) can be active at a time.
+//
+// Runs on Android (flutter run on a phone) and on Linux (flutter run -d linux).
 
 import 'dart:async';
 import 'dart:convert';
@@ -18,10 +23,10 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 // ignore_for_file: avoid_print
 
 void main() {
-  runApp(const AudioCallApp());
+  runApp(const ICCallApp());
 }
 
-/// The Janus servers of the IC setup. Both run the AudioCall plugin.
+/// The Janus servers of the IC setup.
 class ServerPreset {
   const ServerPreset(this.name, this.host);
 
@@ -34,42 +39,46 @@ const List<ServerPreset> kServers = [
   ServerPreset('PC2', '192.168.99.112'),
 ];
 const String kJanusPort = '8188';
-const String kPlugin = 'janus.plugin.audiocall';
+const String kAudioPlugin = 'janus.plugin.audiocall';
+const String kVideoPlugin = 'janus.plugin.customvideocall';
+
+/// Which plugin a call uses.
+enum CallKind { audio, video }
 
 /// Where the app is in a call.
 enum CallPhase {
   idle, // no call
   calling, // we called someone, waiting for them to answer
   ringing, // someone is calling us, the Accept/Decline dialog is open
-  connecting, // call answered, audio connection being set up
-  inCall, // audio is flowing
+  connecting, // call answered, media connection being set up
+  inCall, // media is flowing
 }
 
-class AudioCallApp extends StatelessWidget {
-  const AudioCallApp({super.key});
+class ICCallApp extends StatelessWidget {
+  const ICCallApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'IC AudioCall',
+      title: 'IC Call',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
         useMaterial3: true,
       ),
-      home: const AudioCallPage(),
+      home: const CallPage(),
     );
   }
 }
 
-class AudioCallPage extends StatefulWidget {
-  const AudioCallPage({super.key});
+class CallPage extends StatefulWidget {
+  const CallPage({super.key});
 
   @override
-  State<AudioCallPage> createState() => _AudioCallPageState();
+  State<CallPage> createState() => _CallPageState();
 }
 
-class _AudioCallPageState extends State<AudioCallPage> {
+class _CallPageState extends State<CallPage> {
   // ---------------------------------------------------------------------------
   // Settings
   // ---------------------------------------------------------------------------
@@ -91,9 +100,11 @@ class _AudioCallPageState extends State<AudioCallPage> {
   String _status = 'Choose a server, enter your username and register.';
   bool _isRegistering = false;
   bool _isRegistered = false;
+  bool _videoAvailable = false; // registered on the CustomVideoCall plugin too
   String? _registeredAs;
 
   CallPhase _phase = CallPhase.idle;
+  CallKind _callKind = CallKind.audio;
   String _peerName = '';
   bool _peerIsRemote = false;
 
@@ -103,11 +114,14 @@ class _AudioCallPageState extends State<AudioCallPage> {
 
   bool _isMuted = false;
   bool _isSpeakerOn = false;
+  bool _isCameraOff = false;
+  bool _isFrontCamera = true;
+  bool _hasRemoteVideo = false;
 
   BuildContext? _incomingDialogContext;
   bool _incomingCancelledByCaller = false;
 
-  // Online users, from the plugin's "list" request
+  // Online users, from the AudioCall plugin's "list" request
   String? _thisServerName;
   String? _peerServerName;
   bool? _peerOnline; // null = peer link not configured
@@ -119,12 +133,13 @@ class _AudioCallPageState extends State<AudioCallPage> {
   // ---------------------------------------------------------------------------
 
   int? _sessionId;
-  int? _handleId;
+  int? _audioHandleId; // janus.plugin.audiocall
+  int? _videoHandleId; // janus.plugin.videocall
   WebSocket? _socket;
   StreamSubscription<dynamic>? _socketSub;
   Timer? _keepAliveTimer;
   final Map<String, Completer<Map<String, dynamic>>> _pending = {};
-  Completer<void>? _registrationCompleter;
+  final Map<int, Completer<void>> _registrationCompleters = {};
   Future<void> _eventChain = Future<void>.value();
   int _transactionCounter = 0;
 
@@ -133,15 +148,32 @@ class _AudioCallPageState extends State<AudioCallPage> {
   // ---------------------------------------------------------------------------
 
   MediaStream? _localStream;
+  MediaStream? _remoteStream;
   RTCPeerConnection? _peerConnection;
+  final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
+  final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
 
   bool get _isMobile => Platform.isAndroid || Platform.isIOS;
 
   String get _janusWsUrl =>
       'ws://${_hostController.text.trim()}:${_portController.text.trim()}';
 
-  String get _platformName =>
-      Platform.isAndroid ? 'Android' : (Platform.isLinux ? 'Linux' : Platform.operatingSystem);
+  String get _platformName => Platform.isAndroid
+      ? 'Android'
+      : (Platform.isLinux ? 'Linux' : Platform.operatingSystem);
+
+  /// The plugin handle the current call runs on.
+  int? get _callHandleId =>
+      _callKind == CallKind.audio ? _audioHandleId : _videoHandleId;
+
+  String _kindName(CallKind kind) => kind == CallKind.audio ? 'audio' : 'video';
+
+  @override
+  void initState() {
+    super.initState();
+    _localRenderer.initialize();
+    _remoteRenderer.initialize();
+  }
 
   @override
   void dispose() {
@@ -151,7 +183,10 @@ class _AudioCallPageState extends State<AudioCallPage> {
     _portController.dispose();
     _usernameController.dispose();
     _destinationController.dispose();
-    unawaited(_disposeWebRtc());
+    unawaited(_disposeWebRtc().then((_) {
+      _localRenderer.dispose();
+      _remoteRenderer.dispose();
+    }));
     unawaited(_closeWebSocket());
     super.dispose();
   }
@@ -234,11 +269,7 @@ class _AudioCallPageState extends State<AudioCallPage> {
       if (!completer.isCompleted) completer.completeError(Exception(reason));
     }
     _pending.clear();
-
-    final registration = _registrationCompleter;
-    if (registration != null && !registration.isCompleted) {
-      registration.completeError(Exception(reason));
-    }
+    _failRegistrations(reason);
 
     _closeIncomingDialog();
     unawaited(_disposeWebRtc());
@@ -247,12 +278,20 @@ class _AudioCallPageState extends State<AudioCallPage> {
     if (!mounted) return;
     setState(() {
       _isRegistered = false;
+      _videoAvailable = false;
       _registeredAs = null;
       _sessionId = null;
-      _handleId = null;
+      _audioHandleId = null;
+      _videoHandleId = null;
       _phase = CallPhase.idle;
       _status = '$reason Register again.';
     });
+  }
+
+  void _failRegistrations(String reason) {
+    for (final completer in _registrationCompleters.values) {
+      if (!completer.isCompleted) completer.completeError(Exception(reason));
+    }
   }
 
   void _onSocketData(dynamic data) {
@@ -290,10 +329,11 @@ class _AudioCallPageState extends State<AudioCallPage> {
   }
 
   /// Sends a request and waits for Janus's success / ack / error reply.
+  /// [handleId] addresses one of the plugin handles.
   Future<Map<String, dynamic>> _request(
     Map<String, dynamic> payload, {
     bool needSession = true,
-    bool needHandle = false,
+    int? handleId,
     Duration timeout = const Duration(seconds: 10),
   }) async {
     final socket = _socket;
@@ -307,18 +347,14 @@ class _AudioCallPageState extends State<AudioCallPage> {
       if (sessionId == null) throw Exception('No Janus session');
       message['session_id'] = sessionId;
     }
-    if (needHandle) {
-      final handleId = _handleId;
-      if (handleId == null) throw Exception('No AudioCall plugin handle');
-      message['handle_id'] = handleId;
-    }
+    if (handleId != null) message['handle_id'] = handleId;
 
     final completer = Completer<Map<String, dynamic>>();
     _pending[transaction] = completer;
 
     final body = message['body'];
     print('DEBUG: WS -> ${message['janus']} '
-        '${body is Map ? body['request'] ?? '' : ''}');
+        '${body is Map ? body['request'] ?? '' : ''} (handle ${handleId ?? '-'})');
     socket.add(jsonEncode(message));
 
     try {
@@ -338,7 +374,7 @@ class _AudioCallPageState extends State<AudioCallPage> {
   }
 
   /// Sends a message without waiting for a reply (keepalive, trickle).
-  void _sendNoWait(Map<String, dynamic> payload, {bool needHandle = false}) {
+  void _sendNoWait(Map<String, dynamic> payload, {int? handleId}) {
     final socket = _socket;
     final sessionId = _sessionId;
     if (socket == null || sessionId == null) return;
@@ -348,26 +384,24 @@ class _AudioCallPageState extends State<AudioCallPage> {
       'transaction': _newTransaction(),
       'session_id': sessionId,
     };
-    if (needHandle) {
-      final handleId = _handleId;
-      if (handleId == null) return;
-      message['handle_id'] = handleId;
-    }
+    if (handleId != null) message['handle_id'] = handleId;
     socket.add(jsonEncode(message));
   }
 
-  /// Sends a request to the AudioCall plugin (optionally with an SDP).
+  /// Sends a request to one plugin handle (optionally with an SDP).
   Future<void> _pluginRequest(
+    int? handleId,
     Map<String, dynamic> body, {
     Map<String, dynamic>? jsep,
   }) async {
+    if (handleId == null) throw Exception('Plugin handle not attached');
     await _request(
       {
         'janus': 'message',
         'body': body,
-        if (jsep != null) 'jsep': jsep,
+        'jsep': ?jsep,
       },
-      needHandle: true,
+      handleId: handleId,
       timeout: const Duration(seconds: 15),
     );
   }
@@ -383,6 +417,28 @@ class _AudioCallPageState extends State<AudioCallPage> {
   // Register / disconnect
   // ---------------------------------------------------------------------------
 
+  /// Attaches a plugin and registers [username] on it.
+  Future<int> _attachAndRegister(String plugin, String username) async {
+    final attached = await _request({'janus': 'attach', 'plugin': plugin});
+    final handleId = (attached['data'] as Map)['id'] as int;
+    if (plugin == kAudioPlugin) {
+      _audioHandleId = handleId;
+    } else {
+      _videoHandleId = handleId;
+    }
+
+    final registration = Completer<void>();
+    registration.future.ignore();
+    _registrationCompleters[handleId] = registration;
+    try {
+      await _pluginRequest(handleId, {'request': 'register', 'username': username});
+      await registration.future.timeout(const Duration(seconds: 10));
+    } finally {
+      _registrationCompleters.remove(handleId);
+    }
+    return handleId;
+  }
+
   Future<void> _register() async {
     if (_isRegistering) return;
     final username = _usernameController.text.trim();
@@ -394,6 +450,7 @@ class _AudioCallPageState extends State<AudioCallPage> {
     setState(() {
       _isRegistering = true;
       _isRegistered = false;
+      _videoAvailable = false;
       _registeredAs = null;
       _phase = CallPhase.idle;
       _status = 'Connecting...';
@@ -403,7 +460,8 @@ class _AudioCallPageState extends State<AudioCallPage> {
       await _disposeWebRtc();
       await _closeWebSocket();
       _sessionId = null;
-      _handleId = null;
+      _audioHandleId = null;
+      _videoHandleId = null;
 
       await _connectWebSocket();
 
@@ -412,24 +470,28 @@ class _AudioCallPageState extends State<AudioCallPage> {
       _sessionId = (created['data'] as Map)['id'] as int;
       _startKeepAlive();
 
-      _setStatus('Attaching the AudioCall plugin...');
-      final attached = await _request({'janus': 'attach', 'plugin': kPlugin});
-      _handleId = (attached['data'] as Map)['id'] as int;
+      // Audio (required): the custom AudioCall plugin
+      _setStatus('Registering $username for audio calls...');
+      await _attachAndRegister(kAudioPlugin, username);
 
-      final registration = Completer<void>();
-      registration.future.ignore();
-      _registrationCompleter = registration;
-
-      _setStatus('Registering $username...');
-      await _pluginRequest({'request': 'register', 'username': username});
-      await registration.future.timeout(const Duration(seconds: 10));
+      // Video (best effort): the CustomVideoCall plugin
+      String videoNote = '';
+      try {
+        _setStatus('Registering $username for video calls...');
+        await _attachAndRegister(kVideoPlugin, username);
+        _videoAvailable = true;
+      } catch (error) {
+        print('VIDEO REGISTER ERROR: $error');
+        videoNote = ' Video calls unavailable: $error';
+      }
 
       if (!mounted) return;
       setState(() {
         _isRegistered = true;
         _registeredAs = username;
         _status = 'Registered as $username on $_serverChoice. '
-            'Ready to make or receive audio calls.';
+            'Ready for audio${_videoAvailable ? ' and video' : ''} calls.'
+            '$videoNote';
       });
       unawaited(_refreshUsers());
     } on TimeoutException {
@@ -440,22 +502,23 @@ class _AudioCallPageState extends State<AudioCallPage> {
       _setStatus('Registration failed: $error');
       await _closeWebSocket();
     } finally {
-      _registrationCompleter = null;
       if (mounted) setState(() => _isRegistering = false);
     }
   }
 
   Future<void> _disconnect() async {
     if (_phase != CallPhase.idle) await _hangup();
-    // Destroying the session also removes our username from the plugin
+    // Destroying the session removes our username from both plugins
     _sendNoWait({'janus': 'destroy'});
     await _closeWebSocket();
     if (!mounted) return;
     setState(() {
       _isRegistered = false;
+      _videoAvailable = false;
       _registeredAs = null;
       _sessionId = null;
-      _handleId = null;
+      _audioHandleId = null;
+      _videoHandleId = null;
       _localUsers = [];
       _peerUsers = [];
       _peerOnline = null;
@@ -466,7 +529,8 @@ class _AudioCallPageState extends State<AudioCallPage> {
   Future<void> _refreshUsers() async {
     if (!_isRegistered) return;
     try {
-      await _pluginRequest({'request': 'list'});
+      // The AudioCall plugin lists users on this server AND the other server
+      await _pluginRequest(_audioHandleId, {'request': 'list'});
     } catch (error) {
       print('LIST ERROR: $error');
     }
@@ -485,11 +549,21 @@ class _AudioCallPageState extends State<AudioCallPage> {
       return;
     }
     if (type == 'hangup') {
-      // Janus says the PeerConnection is gone; the plugin event follows
+      // Janus says a PeerConnection is gone; the plugin event follows
       print('DEBUG: Janus PeerConnection hangup: ${message['reason']}');
       return;
     }
     if (type != 'event') return;
+
+    // Which plugin is this event from?
+    final sender = message['sender'];
+    final senderId = sender is num ? sender.toInt() : null;
+    final CallKind? kind = senderId == null
+        ? null
+        : (senderId == _audioHandleId
+            ? CallKind.audio
+            : (senderId == _videoHandleId ? CallKind.video : null));
+    if (kind == null) return;
 
     final pluginData = message['plugindata'];
     if (pluginData is! Map) return;
@@ -501,14 +575,15 @@ class _AudioCallPageState extends State<AudioCallPage> {
 
     // Plugin errors, e.g. 476 username taken, 478 no such user, 484 audio only
     if (data['error'] != null) {
-      final text = 'Error ${data['error_code'] ?? ''}: ${data['error']}';
+      final text = '${_kindName(kind)} error ${data['error_code'] ?? ''}: '
+          '${data['error']}';
       print('PLUGIN ERROR: $text');
-      final registration = _registrationCompleter;
+      final registration = _registrationCompleters[senderId];
       if (registration != null && !registration.isCompleted) {
         registration.completeError(Exception(text));
         return;
       }
-      if (_phase != CallPhase.idle) {
+      if (_phase != CallPhase.idle && kind == _callKind) {
         await _endCall(text);
       } else {
         _setStatus(text);
@@ -520,18 +595,31 @@ class _AudioCallPageState extends State<AudioCallPage> {
     if (result is! Map) return;
     final r = Map<String, dynamic>.from(result);
 
-    // Reply to "list"
+    // Reply to "list" (only requested from the AudioCall plugin)
     if (r['list'] is List) {
-      _updateUserLists(r);
+      if (kind == CallKind.audio) _updateUserLists(r);
       return;
     }
 
     final event = r['event'] as String?;
-    print('DEBUG: AudioCall event: $event');
+    print('DEBUG: ${_kindName(kind)} event: $event');
+
+    // An incoming call on one plugin while we are busy on the other
+    if (event == 'incomingcall' && _phase != CallPhase.idle) {
+      await _sendHangup(senderId, 'Busy');
+      return;
+    }
+    // Ignore events of the plugin that has no call right now
+    if (event != 'registered' &&
+        event != 'incomingcall' &&
+        _phase != CallPhase.idle &&
+        kind != _callKind) {
+      return;
+    }
 
     switch (event) {
       case 'registered':
-        final registration = _registrationCompleter;
+        final registration = _registrationCompleters[senderId];
         if (registration != null && !registration.isCompleted) {
           registration.complete();
         }
@@ -548,7 +636,7 @@ class _AudioCallPageState extends State<AudioCallPage> {
       case 'incomingcall':
         final caller = (r['username'] ?? 'unknown').toString();
         final remote = r['remote'] == true;
-        unawaited(_handleIncomingCall(caller, remote, jsep));
+        unawaited(_handleIncomingCall(kind, caller, remote, jsep));
         return;
 
       case 'accepted':
@@ -558,7 +646,7 @@ class _AudioCallPageState extends State<AudioCallPage> {
         }
         if (_phase == CallPhase.calling) {
           if (mounted) setState(() => _phase = CallPhase.connecting);
-          _setStatus('$_peerName answered. Connecting audio...');
+          _setStatus('$_peerName answered. Connecting...');
         }
         return;
 
@@ -567,7 +655,7 @@ class _AudioCallPageState extends State<AudioCallPage> {
         return;
 
       default:
-        return;
+        return; // 'set', 'update', 'simulcast', ...
     }
   }
 
@@ -605,22 +693,34 @@ class _AudioCallPageState extends State<AudioCallPage> {
   // WebRTC
   // ---------------------------------------------------------------------------
 
-  Future<RTCPeerConnection> _createMediaAndPeerConnection() async {
+  Future<RTCPeerConnection> _createMediaAndPeerConnection(CallKind kind) async {
     await _disposeWebRtc();
+    final handleId = _callHandleId;
 
+    // Audio calls never touch the camera
     final stream = await navigator.mediaDevices.getUserMedia({
       'audio': {
         'echoCancellation': true,
         'noiseSuppression': true,
         'autoGainControl': true,
       },
-      'video': false,
+      'video': kind == CallKind.video
+          ? {
+              'facingMode': 'user',
+              'width': {'ideal': 640},
+              'height': {'ideal': 480},
+              'frameRate': {'ideal': 24},
+            }
+          : false,
     });
     if (stream.getAudioTracks().isEmpty) {
       throw Exception('No microphone found.');
     }
     _localStream = stream;
+    _isFrontCamera = true;
+    if (kind == CallKind.video) _localRenderer.srcObject = stream;
     _applyMute();
+    _applyCamera();
 
     // LAN only: host candidates are enough, no STUN/TURN server needed
     final pc = await createPeerConnection({
@@ -638,7 +738,7 @@ class _AudioCallPageState extends State<AudioCallPage> {
           'sdpMid': candidate.sdpMid,
           'sdpMLineIndex': candidate.sdpMLineIndex,
         },
-      }, needHandle: true);
+      }, handleId: handleId);
     };
 
     pc.onIceGatheringState = (state) {
@@ -646,8 +746,21 @@ class _AudioCallPageState extends State<AudioCallPage> {
         _sendNoWait({
           'janus': 'trickle',
           'candidate': {'completed': true},
-        }, needHandle: true);
+        }, handleId: handleId);
       }
+    };
+
+    pc.onTrack = (event) async {
+      print('DEBUG: remote ${event.track.kind} track');
+      if (event.track.kind != 'video') return; // remote audio plays by itself
+      if (event.streams.isNotEmpty) {
+        _remoteRenderer.srcObject = event.streams.first;
+      } else {
+        _remoteStream ??= await createLocalMediaStream('remote');
+        await _remoteStream!.addTrack(event.track);
+        _remoteRenderer.srcObject = _remoteStream;
+      }
+      if (mounted) setState(() => _hasRemoteVideo = true);
     };
 
     pc.onConnectionState = (state) {
@@ -656,18 +769,18 @@ class _AudioCallPageState extends State<AudioCallPage> {
         if (_phase == CallPhase.connecting || _phase == CallPhase.calling) {
           if (mounted) setState(() => _phase = CallPhase.inCall);
           _startCallTimer();
-          _setStatus('In call with $_peerName'
+          _setStatus('In ${_kindName(_callKind)} call with $_peerName'
               '${_peerIsRemote ? ' (other server)' : ''}.');
           unawaited(_applySpeaker());
         }
       } else if (state ==
           RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
-        unawaited(_hangup(reason: 'Audio connection failed'));
-        _setStatus('Call failed: the audio connection could not be set up.');
+        unawaited(_hangup(reason: 'Media connection failed'));
+        _setStatus('Call failed: the media connection could not be set up.');
       }
     };
 
-    for (final track in stream.getAudioTracks()) {
+    for (final track in stream.getTracks()) {
       await pc.addTrack(track, stream);
     }
     await _applySpeaker();
@@ -684,9 +797,14 @@ class _AudioCallPageState extends State<AudioCallPage> {
 
   Future<void> _disposeWebRtc() async {
     final stream = _localStream;
+    final remote = _remoteStream;
     final pc = _peerConnection;
     _localStream = null;
+    _remoteStream = null;
     _peerConnection = null;
+    _hasRemoteVideo = false;
+    _localRenderer.srcObject = null;
+    _remoteRenderer.srcObject = null;
     try {
       if (stream != null) {
         for (final track in stream.getTracks()) {
@@ -694,6 +812,7 @@ class _AudioCallPageState extends State<AudioCallPage> {
         }
         await stream.dispose();
       }
+      await remote?.dispose();
     } catch (error) {
       print('Stream cleanup warning: $error');
     }
@@ -715,6 +834,14 @@ class _AudioCallPageState extends State<AudioCallPage> {
     }
   }
 
+  /// Camera off = the video track is disabled (the other side sees black).
+  void _applyCamera() {
+    for (final track
+        in _localStream?.getVideoTracks() ?? const <MediaStreamTrack>[]) {
+      track.enabled = !_isCameraOff;
+    }
+  }
+
   Future<void> _applySpeaker() async {
     if (!_isMobile) return; // the desktop always plays through its speakers
     try {
@@ -727,6 +854,22 @@ class _AudioCallPageState extends State<AudioCallPage> {
   void _toggleMute() {
     setState(() => _isMuted = !_isMuted);
     _applyMute();
+  }
+
+  void _toggleCamera() {
+    setState(() => _isCameraOff = !_isCameraOff);
+    _applyCamera();
+  }
+
+  Future<void> _switchCamera() async {
+    final tracks = _localStream?.getVideoTracks();
+    if (tracks == null || tracks.isEmpty) return;
+    try {
+      await Helper.switchCamera(tracks.first);
+      if (mounted) setState(() => _isFrontCamera = !_isFrontCamera);
+    } catch (error) {
+      print('Switch camera failed: $error');
+    }
   }
 
   Future<void> _toggleSpeaker() async {
@@ -755,7 +898,7 @@ class _AudioCallPageState extends State<AudioCallPage> {
   // Outgoing call
   // ---------------------------------------------------------------------------
 
-  Future<void> _startCall() async {
+  Future<void> _startCall(CallKind kind) async {
     final destination = _destinationController.text.trim();
     if (!_isRegistered) {
       _setStatus('Register first.');
@@ -770,26 +913,35 @@ class _AudioCallPageState extends State<AudioCallPage> {
       return;
     }
     if (_phase != CallPhase.idle) return;
+    if (kind == CallKind.video && !_videoAvailable) {
+      _setStatus('Video calls are not available on this server.');
+      return;
+    }
 
     setState(() {
+      _callKind = kind;
       _phase = CallPhase.calling;
       _peerName = destination;
       _peerIsRemote = _peerUsers.contains(destination);
       _isMuted = false;
-      _isSpeakerOn = false;
-      _status = 'Preparing the microphone...';
+      _isCameraOff = false;
+      _isSpeakerOn = kind == CallKind.video; // video calls start on loudspeaker
+      _status = kind == CallKind.video
+          ? 'Preparing the camera and microphone...'
+          : 'Preparing the microphone...';
     });
 
     try {
-      final pc = await _createMediaAndPeerConnection();
+      final pc = await _createMediaAndPeerConnection(kind);
       final offer = await pc.createOffer({
         'offerToReceiveAudio': 1,
-        'offerToReceiveVideo': 0,
+        'offerToReceiveVideo': kind == CallKind.video ? 1 : 0,
       });
       await pc.setLocalDescription(offer);
 
-      _setStatus('Calling $destination...');
+      _setStatus('Calling $destination (${_kindName(kind)})...');
       await _pluginRequest(
+        _callHandleId,
         {'request': 'call', 'username': destination},
         jsep: {'type': offer.type, 'sdp': offer.sdp},
       );
@@ -804,46 +956,49 @@ class _AudioCallPageState extends State<AudioCallPage> {
   // ---------------------------------------------------------------------------
 
   Future<void> _handleIncomingCall(
+    CallKind kind,
     String caller,
     bool remote,
     Map<String, dynamic>? jsep,
   ) async {
+    final handleId = kind == CallKind.audio ? _audioHandleId : _videoHandleId;
     if (_phase != CallPhase.idle) {
-      // Should not happen (the plugin answers "User busy" for us), but be safe
-      await _sendHangup('Busy');
+      await _sendHangup(handleId, 'Busy');
       return;
     }
     if (jsep == null) {
       _setStatus('Incoming call from $caller had no SDP offer.');
-      await _sendHangup('No SDP');
+      await _sendHangup(handleId, 'No SDP');
       return;
     }
 
     setState(() {
+      _callKind = kind;
       _phase = CallPhase.ringing;
       _peerName = caller;
       _peerIsRemote = remote;
       _isMuted = false;
-      _isSpeakerOn = false;
-      _status = 'Incoming call from $caller'
+      _isCameraOff = false;
+      _isSpeakerOn = kind == CallKind.video;
+      _status = 'Incoming ${_kindName(kind)} call from $caller'
           '${remote ? ' (other server)' : ''}';
     });
     _incomingCancelledByCaller = false;
 
-    final accept = await _showIncomingCallDialog(caller, remote);
+    final accept = await _showIncomingCallDialog(kind, caller, remote);
     _incomingDialogContext = null;
 
     if (_incomingCancelledByCaller) {
       _incomingCancelledByCaller = false;
       if (mounted) setState(() => _phase = CallPhase.idle);
-      _setStatus('Missed call from $caller (caller hung up).');
+      _setStatus('Missed ${_kindName(kind)} call from $caller (caller hung up).');
       return;
     }
     if (_phase != CallPhase.ringing) return; // connection lost meanwhile
 
     if (!accept) {
       if (mounted) setState(() => _phase = CallPhase.idle);
-      await _sendHangup('Declined');
+      await _sendHangup(handleId, 'Declined');
       _setStatus('Declined the call from $caller.');
       return;
     }
@@ -853,37 +1008,43 @@ class _AudioCallPageState extends State<AudioCallPage> {
         _phase = CallPhase.connecting;
         _status = 'Answering $caller...';
       });
-      final pc = await _createMediaAndPeerConnection();
+      final pc = await _createMediaAndPeerConnection(kind);
       await pc.setRemoteDescription(
         RTCSessionDescription(jsep['sdp'] as String?, jsep['type'] as String?),
       );
       final answer = await pc.createAnswer({
         'offerToReceiveAudio': 1,
-        'offerToReceiveVideo': 0,
+        'offerToReceiveVideo': kind == CallKind.video ? 1 : 0,
       });
       await pc.setLocalDescription(answer);
       await _pluginRequest(
+        handleId,
         {'request': 'accept'},
         jsep: {'type': answer.type, 'sdp': answer.sdp},
       );
-      _setStatus('Answered. Connecting audio with $caller...');
+      _setStatus('Answered. Connecting with $caller...');
     } catch (error) {
       print('ACCEPT ERROR: $error');
-      await _sendHangup('Answer failed');
+      await _sendHangup(handleId, 'Answer failed');
       await _endCall('Could not answer: $error');
     }
   }
 
-  Future<bool> _showIncomingCallDialog(String caller, bool remote) async {
+  Future<bool> _showIncomingCallDialog(
+    CallKind kind,
+    String caller,
+    bool remote,
+  ) async {
     if (!mounted) return false;
+    final video = kind == CallKind.video;
     final accepted = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
       builder: (dialogContext) {
         _incomingDialogContext = dialogContext;
         return AlertDialog(
-          icon: const Icon(Icons.call, size: 36),
-          title: Text('Incoming call from $caller'),
+          icon: Icon(video ? Icons.videocam : Icons.call, size: 36),
+          title: Text('Incoming ${video ? 'video' : 'audio'} call from $caller'),
           content: Text(remote
               ? 'This user is registered on the other Janus server.'
               : 'This user is registered on this Janus server.'),
@@ -895,7 +1056,7 @@ class _AudioCallPageState extends State<AudioCallPage> {
             ),
             FilledButton.icon(
               onPressed: () => Navigator.of(dialogContext).pop(true),
-              icon: const Icon(Icons.call),
+              icon: Icon(video ? Icons.videocam : Icons.call),
               label: const Text('Accept'),
             ),
           ],
@@ -917,11 +1078,11 @@ class _AudioCallPageState extends State<AudioCallPage> {
   // Hang up
   // ---------------------------------------------------------------------------
 
-  /// Tells the plugin to end (or refuse) the current call.
-  Future<void> _sendHangup(String reason) async {
-    if (_socket == null || _handleId == null) return;
+  /// Tells a plugin to end (or refuse) a call.
+  Future<void> _sendHangup(int? handleId, String reason) async {
+    if (_socket == null || handleId == null) return;
     try {
-      await _pluginRequest({'request': 'hangup', 'reason': reason});
+      await _pluginRequest(handleId, {'request': 'hangup', 'reason': reason});
     } catch (error) {
       print('HANGUP ERROR: $error');
     }
@@ -931,11 +1092,12 @@ class _AudioCallPageState extends State<AudioCallPage> {
   Future<void> _hangup({String reason = 'Hung up'}) async {
     if (_phase == CallPhase.idle) return;
     final peer = _peerName;
+    final handleId = _callHandleId;
     await _endCall('Call with $peer ended.');
-    await _sendHangup(reason);
+    await _sendHangup(handleId, reason);
   }
 
-  /// Back to idle: release microphone and PeerConnection.
+  /// Back to idle: release microphone, camera and PeerConnection.
   Future<void> _endCall(String status) async {
     _stopCallTimer();
     if (mounted) {
@@ -943,6 +1105,7 @@ class _AudioCallPageState extends State<AudioCallPage> {
         _phase = CallPhase.idle;
         _isMuted = false;
         _isSpeakerOn = false;
+        _isCameraOff = false;
         _status = status;
       });
     }
@@ -978,7 +1141,7 @@ class _AudioCallPageState extends State<AudioCallPage> {
       case CallPhase.ringing:
         return 'Incoming call';
       case CallPhase.connecting:
-        return 'Connecting audio...';
+        return 'Connecting...';
       case CallPhase.inCall:
         return 'In call  ${_formatDuration(_callDuration)}';
     }
@@ -1141,10 +1304,76 @@ class _AudioCallPageState extends State<AudioCallPage> {
               enabled: idle,
             ),
             const SizedBox(height: 12),
-            FilledButton.icon(
-              onPressed: idle ? _startCall : null,
-              icon: const Icon(Icons.call),
-              label: const Text('Audio call'),
+            Row(
+              children: [
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: idle ? () => _startCall(CallKind.audio) : null,
+                    icon: const Icon(Icons.call),
+                    label: const Text('Audio call'),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: FilledButton.tonalIcon(
+                    onPressed: idle && _videoAvailable
+                        ? () => _startCall(CallKind.video)
+                        : null,
+                    icon: const Icon(Icons.videocam),
+                    label: const Text('Video call'),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Remote video full width, local preview in the corner.
+  Widget _buildVideoArea() {
+    return AspectRatio(
+      aspectRatio: 3 / 4,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: Stack(
+          children: [
+            Positioned.fill(
+              child: Container(
+                color: Colors.black,
+                child: _hasRemoteVideo
+                    ? RTCVideoView(
+                        _remoteRenderer,
+                        objectFit:
+                            RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                      )
+                    : const Center(
+                        child: Icon(Icons.person, size: 96, color: Colors.white38),
+                      ),
+              ),
+            ),
+            Positioned(
+              right: 8,
+              top: 8,
+              width: 96,
+              height: 128,
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: Container(
+                  color: Colors.grey.shade900,
+                  child: _isCameraOff
+                      ? const Center(
+                          child: Icon(Icons.videocam_off, color: Colors.white54),
+                        )
+                      : RTCVideoView(
+                          _localRenderer,
+                          mirror: _isFrontCamera,
+                          objectFit:
+                              RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                        ),
+                ),
+              ),
             ),
           ],
         ),
@@ -1154,24 +1383,34 @@ class _AudioCallPageState extends State<AudioCallPage> {
 
   Widget _buildCallCard() {
     final scheme = Theme.of(context).colorScheme;
+    final video = _callKind == CallKind.video;
     return Card(
       color: scheme.primaryContainer,
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           children: [
-            const Icon(Icons.person, size: 56),
+            if (video) ...[
+              _buildVideoArea(),
+              const SizedBox(height: 8),
+            ] else
+              const Icon(Icons.person, size: 56),
             Text(
               _peerName,
               style: Theme.of(context).textTheme.headlineSmall,
             ),
-            if (_peerIsRemote)
-              const Text('on the other server', style: TextStyle(fontSize: 12)),
+            Text(
+              '${video ? 'Video' : 'Audio'} call'
+              '${_peerIsRemote ? ' · other server' : ''}',
+              style: const TextStyle(fontSize: 12),
+            ),
             const SizedBox(height: 4),
             Text(_phaseText, style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 16),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            Wrap(
+              alignment: WrapAlignment.spaceEvenly,
+              spacing: 16,
+              runSpacing: 12,
               children: [
                 _roundButton(
                   icon: _isMuted ? Icons.mic_off : Icons.mic,
@@ -1179,6 +1418,19 @@ class _AudioCallPageState extends State<AudioCallPage> {
                   onPressed: _toggleMute,
                   active: _isMuted,
                 ),
+                if (video)
+                  _roundButton(
+                    icon: _isCameraOff ? Icons.videocam_off : Icons.videocam,
+                    label: _isCameraOff ? 'Camera on' : 'Camera off',
+                    onPressed: _toggleCamera,
+                    active: _isCameraOff,
+                  ),
+                if (video && _isMobile)
+                  _roundButton(
+                    icon: Icons.cameraswitch,
+                    label: 'Flip',
+                    onPressed: _isCameraOff ? null : _switchCamera,
+                  ),
                 _roundButton(
                   icon: _isSpeakerOn ? Icons.volume_up : Icons.hearing,
                   label: _isSpeakerOn ? 'Speaker' : 'Earpiece',
@@ -1240,8 +1492,11 @@ class _AudioCallPageState extends State<AudioCallPage> {
             SelectableText(
               'Platform: $_platformName\n'
               'Janus: $_janusWsUrl (${_socket != null ? 'connected' : 'disconnected'})\n'
-              'Session: ${_sessionId ?? '-'}   Handle: ${_handleId ?? '-'}\n'
-              'Registered: ${_registeredAs ?? 'no'}   Call: ${_phase.name}',
+              'Session: ${_sessionId ?? '-'}\n'
+              'Audio handle: ${_audioHandleId ?? '-'}   '
+              'Video handle: ${_videoHandleId ?? '-'}\n'
+              'Registered: ${_registeredAs ?? 'no'}   '
+              'Call: ${_phase.name}${_phase == CallPhase.idle ? '' : ' (${_kindName(_callKind)})'}',
               style: const TextStyle(fontSize: 12),
             ),
           ],
@@ -1259,7 +1514,7 @@ class _AudioCallPageState extends State<AudioCallPage> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('IC AudioCall'),
+        title: const Text('IC Call'),
         actions: [
           if (_isRegistered)
             Padding(
