@@ -11,10 +11,15 @@
 #               0 disables the link (local calls only)
 # ws_port     = WebSocket port of this Janus, told to apps that discover
 #               the servers (default 8188)
+# public_host = address apps on the INTERNET use to reach this server, e.g.
+#               its public IP. It is shared with the other servers and
+#               returned in "list", so an app that reaches any one server
+#               learns all of them. Leave unset on a LAN-only setup.
 
 general: {
 	#events = false
 	#server_name = "pc1"
 	#link_port = 7088
 	#ws_port = 8188
+	#public_host = "203.0.113.10"
 }

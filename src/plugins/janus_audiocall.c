@@ -280,7 +280,7 @@
 
 /* Plugin information */
 #define JANUS_AUDIOCALL_VERSION			6
-#define JANUS_AUDIOCALL_VERSION_STRING	"0.2.0-ic"
+#define JANUS_AUDIOCALL_VERSION_STRING	"0.3.0-ic"
 /* IC: this file builds two plugins. Normally it is the audio-only AudioCall
  * plugin; the build also generates janus_customvideocall.c from it (all names
  * renamed) and compiles that with -DIC_VIDEO to get the CustomVideoCall plugin,
@@ -508,6 +508,13 @@ static void janus_audiocall_message_free(janus_audiocall_message *msg) {
  * Apps find the servers the same way: they broadcast {"type":"discover"}
  * and each server answers {"type":"here","server":...,"users":N,"ws_port":...}.
  *
+ * Apps on the internet can't broadcast to the servers. For them, every server
+ * can be given a public_host (the address apps use to reach it, e.g. its public
+ * IP). It is added to the hello (so every server learns everybody's public
+ * address), to "here", and to the "list"/"online" results: an app connects to
+ * any one server over the WebSocket, sends "list", and gets every server with
+ * its public_host, ws_port and users, so it can pick the least busy one.
+ *
  * Calls between servers use unicast messages to the other server
  * (call / accepted / hangup) and media packets 'A'/'V'/'K' + call_id.
  * Media is only accepted from the address the call was set up with.
@@ -515,6 +522,7 @@ static void janus_audiocall_message_free(janus_audiocall_message *msg) {
 static gboolean link_enabled = FALSE;
 static char *link_server_name = NULL;
 static uint16_t link_local_port = JANUS_AUDIOCALL_DEFAULT_LINK_PORT, link_ws_port = 8188;
+static char *link_public_host = NULL;	/* address apps use to reach this server (public_host), or NULL */
 static int link_fd = -1;
 static GThread *link_thread = NULL;
 static volatile gint link_dirty = 0;			/* our users changed: announce now */
@@ -526,6 +534,8 @@ typedef struct janus_audiocall_peer {
 	char *name;
 	struct sockaddr_in addr;	/* where its plugin's link socket is */
 	json_t *users;				/* usernames registered there (sorted array) */
+	char *public_host;			/* address apps use to reach it (its public_host), or NULL */
+	uint16_t ws_port;			/* its Janus WebSocket port */
 	gint64 last_seen;
 } janus_audiocall_peer;
 static GHashTable *link_peers = NULL;	/* name -> janus_audiocall_peer, protected by link_mutex */
@@ -544,6 +554,7 @@ static void janus_audiocall_peer_free(janus_audiocall_peer *peer) {
 		return;
 	g_free(peer->name);
 	json_decref(peer->users);
+	g_free(peer->public_host);
 	g_free(peer);
 }
 
@@ -644,7 +655,8 @@ static gboolean janus_audiocall_peer_find_user(const char *username, struct sock
 
 /* What we know about the other servers, as
  *   {"peer_online":bool, "peer_server":"pc2, pc3", "peer_list":[all their users],
- *    "servers":[{"server":"pc2","ip":"192.168.99.112","users":[...]}, ...]}
+ *    "servers":[{"server":"pc2","ip":"192.168.99.112","public_host":"...","ws_port":8188,"users":[...]}, ...]}
+ * (public_host only if that server has one configured)
  * (sorted by server name, so the result only changes when something changed) */
 static json_t *janus_audiocall_peer_info(void) {
 	json_t *info = json_object();
@@ -664,6 +676,9 @@ static json_t *janus_audiocall_peer_info(void) {
 			json_t *s = json_object();
 			json_object_set_new(s, "server", json_string(peer->name));
 			json_object_set_new(s, "ip", json_string(ip));
+			if(peer->public_host != NULL)
+				json_object_set_new(s, "public_host", json_string(peer->public_host));
+			json_object_set_new(s, "ws_port", json_integer(peer->ws_port));
 			json_object_set_new(s, "users", json_deep_copy(peer->users));
 			json_array_append_new(servers, s);
 			json_array_extend(peer_list, peer->users);
@@ -856,6 +871,9 @@ static void janus_audiocall_push_online(gboolean force) {
 	link_last_online = signature;
 	json_object_set_new(info, "event", json_string("online"));
 	json_object_set_new(info, "server", json_string(link_server_name));
+	if(link_public_host != NULL)
+		json_object_set_new(info, "public_host", json_string(link_public_host));
+	json_object_set_new(info, "ws_port", json_integer(link_ws_port));
 	GList *list = NULL;
 	janus_mutex_lock(&sessions_mutex);
 	if(usernames != NULL) {
@@ -891,6 +909,8 @@ static void janus_audiocall_link_announce(void) {
 	json_object_set_new(hello, "server", json_string(link_server_name));
 	json_object_set_new(hello, "users", janus_audiocall_local_users());
 	json_object_set_new(hello, "ws_port", json_integer(link_ws_port));
+	if(link_public_host != NULL)
+		json_object_set_new(hello, "public_host", json_string(link_public_host));
 	char *text = json_dumps(hello, JSON_COMPACT);
 	json_decref(hello);
 	if(text == NULL)
@@ -958,6 +978,8 @@ static void janus_audiocall_link_handle(json_t *msg, const struct sockaddr_in *f
 		if(name == NULL || !strcmp(name, link_server_name))
 			return;
 		json_t *users = json_object_get(msg, "users");
+		const char *public_host = json_string_value(json_object_get(msg, "public_host"));
+		json_int_t ws_port = json_integer_value(json_object_get(msg, "ws_port"));
 		gboolean is_new = FALSE, moved = FALSE, changed = FALSE;
 		janus_mutex_lock(&link_mutex);
 		janus_audiocall_peer *peer = g_hash_table_lookup(link_peers, name);
@@ -976,6 +998,16 @@ static void janus_audiocall_link_handle(json_t *msg, const struct sockaddr_in *f
 		changed = is_new || !json_equal(peer->users, new_users);
 		json_decref(peer->users);
 		peer->users = new_users;
+		if(g_strcmp0(peer->public_host, public_host) != 0) {
+			g_free(peer->public_host);
+			peer->public_host = g_strdup(public_host);
+			changed = TRUE;
+		}
+		uint16_t new_ws_port = (ws_port > 0 && ws_port <= 65535) ? (uint16_t)ws_port : 8188;
+		if(peer->ws_port != new_ws_port) {
+			peer->ws_port = new_ws_port;
+			changed = TRUE;
+		}
 		janus_mutex_unlock(&link_mutex);
 		if(is_new) {
 			JANUS_LOG(LOG_INFO, "[AudioCall] Discovered server '%s' at %s\n", name,
@@ -995,6 +1027,8 @@ static void janus_audiocall_link_handle(json_t *msg, const struct sockaddr_in *f
 		json_object_set_new(reply, "server", json_string(link_server_name));
 		json_object_set_new(reply, "users", json_integer(json_array_size(users)));
 		json_object_set_new(reply, "ws_port", json_integer(link_ws_port));
+		if(link_public_host != NULL)
+			json_object_set_new(reply, "public_host", json_string(link_public_host));
 		json_decref(users);
 		janus_audiocall_link_send_to(from, reply);
 		json_decref(reply);
@@ -1282,6 +1316,9 @@ int janus_audiocall_init(janus_callbacks *callback, const char *config_path) {
 		item = janus_config_get(config, config_general, janus_config_type_item, "ws_port");
 		if(item != NULL && item->value != NULL && janus_string_to_uint16(item->value, &link_ws_port) < 0)
 			JANUS_LOG(LOG_WARN, "[AudioCall] Invalid ws_port '%s', using %d\n", item->value, link_ws_port);
+		item = janus_config_get(config, config_general, janus_config_type_item, "public_host");
+		if(item != NULL && item->value != NULL && strlen(item->value) > 0)
+			link_public_host = g_strdup(item->value);
 		if(janus_config_get(config, config_general, janus_config_type_item, "peer_host") != NULL ||
 				janus_config_get(config, config_general, janus_config_type_item, "peer_port") != NULL) {
 			JANUS_LOG(LOG_WARN, "[AudioCall] peer_host/peer_port are no longer used (other servers are found automatically), ignoring them\n");
@@ -1336,6 +1373,9 @@ int janus_audiocall_init(janus_callbacks *callback, const char *config_path) {
 		}
 	}
 	JANUS_LOG(LOG_INFO, "%s initialized! (server '%s')\n", JANUS_AUDIOCALL_NAME, link_server_name);
+	if(link_public_host != NULL)
+		JANUS_LOG(LOG_INFO, "[AudioCall] Apps on the internet reach this server at %s:%d (public_host)\n",
+			link_public_host, link_ws_port);
 	return 0;
 }
 
@@ -1368,6 +1408,8 @@ void janus_audiocall_destroy(void) {
 	link_last_online = NULL;
 	g_free(link_server_name);
 	link_server_name = NULL;
+	g_free(link_public_host);
+	link_public_host = NULL;
 	link_enabled = FALSE;
 	janus_mutex_lock(&remote_calls_mutex);
 	if(remote_calls != NULL) {
@@ -2082,6 +2124,9 @@ static void *janus_audiocall_handler(void *data) {
 			json_object_set_new(result, "list", list);
 			janus_mutex_unlock(&sessions_mutex);
 			json_object_set_new(result, "server", json_string(link_server_name));
+			if(link_public_host != NULL)
+				json_object_set_new(result, "public_host", json_string(link_public_host));
+			json_object_set_new(result, "ws_port", json_integer(link_ws_port));
 			/* IC: also the users of all the other servers we know of */
 			if(link_enabled) {
 				json_t *info = janus_audiocall_peer_info();
