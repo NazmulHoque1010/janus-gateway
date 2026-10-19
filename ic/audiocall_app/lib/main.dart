@@ -3,17 +3,21 @@
 // Audio and video calls through the IC Janus servers, over the Janus
 // WebSocket API. No FreeSWITCH and no SIP.
 //
-// No registration screen and no server addresses: the username is set when
-// the app is built, and on start the app
-//   1. broadcasts {"type":"discover"} on the LAN (UDP 7088),
-//   2. collects the answers of the Janus servers (name + how many users),
-//   3. joins the server with the FEWEST users (random pick on a tie),
-//   4. registers the username on both plugins.
+// No registration screen: the username is set when the app is built, and on
+// start the app finds the Janus servers in two ways at the same time:
+//   - LAN: broadcasts {"type":"discover"} (UDP 7088) and collects the answers;
+//   - internet: connects to each SEED server (IC_SEEDS) over its WebSocket and
+//     sends the AudioCall "list" request, which returns every server the seed
+//     knows, with its public address (public_host) and its users.
+// Then it joins the server with the FEWEST users (random pick on a tie) and
+// registers the username on both plugins. A server found on the LAN is reached
+// at its LAN address; the others at their public_host.
 // The online users of every server are pushed by the plugin ("online" events).
 //
 //   flutter run -d <phone>  --dart-define=IC_USER=Nazmul
 //   flutter run -d linux    --dart-define=IC_USER=Sazid
-// Optional, if the network blocks broadcasts: --dart-define=IC_SEED=<IP of any Janus>
+// Servers on the internet (one is enough, more are tried in case one is down):
+//   --dart-define=IC_SEEDS=203.0.113.10,203.0.113.11   (host or host:port)
 //
 //   Audio calls: custom janus.plugin.audiocall plugin. Audio only (no camera).
 //   Video calls: custom janus.plugin.customvideocall plugin (built from the
@@ -42,14 +46,32 @@ void main() {
 /// This app's username, set at build time: --dart-define=IC_USER=Nazmul
 const String kUsername = String.fromEnvironment('IC_USER');
 
-/// Optional: the IP of one Janus server to ask directly, for networks that
-/// block broadcasts: --dart-define=IC_SEED=192.168.97.135
+/// Optional: Janus servers to ask over their WebSocket which servers exist,
+/// for servers on the internet: --dart-define=IC_SEEDS=203.0.113.10,203.0.113.11
+/// (host or host:port, comma-separated; the port defaults to 8188).
+/// IC_SEED (one server) is still accepted as well.
+const String kSeeds = String.fromEnvironment('IC_SEEDS');
 const String kSeedServer = String.fromEnvironment('IC_SEED');
+
+/// The seed servers from IC_SEEDS and IC_SEED, as (host, port).
+List<(String, int)> parseSeeds() {
+  final seeds = <(String, int)>[];
+  for (final entry in '$kSeeds,$kSeedServer'.split(',')) {
+    final text = entry.trim();
+    if (text.isEmpty) continue;
+    final colon = text.lastIndexOf(':');
+    final port = colon > 0 ? int.tryParse(text.substring(colon + 1)) : null;
+    final host = port != null ? text.substring(0, colon) : text;
+    final seed = (host, port ?? 8188);
+    if (!seeds.contains(seed)) seeds.add(seed);
+  }
+  return seeds;
+}
 
 /// UDP port the AudioCall plugin answers "discover" on (its link port).
 const int kDiscoveryPort = 7088;
 
-/// A Janus server that answered our "discover".
+/// A Janus server found on the LAN or through a seed server.
 class FoundServer {
   const FoundServer(this.name, this.host, this.port, this.users);
 
@@ -472,7 +494,7 @@ class _CallPageState extends State<CallPage> {
 
   /// Asks the LAN which Janus servers exist: broadcasts {"type":"discover"}
   /// and collects the {"type":"here"} answers for about 1.5 seconds.
-  Future<List<FoundServer>> _discoverServers() async {
+  Future<List<FoundServer>> _discoverLan() async {
     final socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
     socket.broadcastEnabled = true;
     final found = <String, FoundServer>{};
@@ -497,10 +519,6 @@ class _CallPageState extends State<CallPage> {
 
     final request = utf8.encode(jsonEncode({'type': 'discover'}));
     final targets = <InternetAddress>[InternetAddress('255.255.255.255')];
-    if (kSeedServer.isNotEmpty) {
-      final seed = InternetAddress.tryParse(kSeedServer);
-      if (seed != null) targets.add(seed);
-    }
     // Sent twice: Wi-Fi can lose a broadcast
     for (var i = 0; i < 2; i++) {
       for (final target in targets) {
@@ -515,7 +533,156 @@ class _CallPageState extends State<CallPage> {
     await Future<void>.delayed(const Duration(milliseconds: 500));
     await subscription.cancel();
     socket.close();
-    print('DISCOVER: ${found.values.map((s) => '${s.name}@${s.host}=${s.users}').join(', ')}');
+    print('DISCOVER LAN: ${found.values.map((s) => '${s.name}@${s.host}=${s.users}').join(', ')}');
+    return found.values.toList();
+  }
+
+  /// Asks one seed server, over its WebSocket, which servers exist: a short
+  /// Janus session, the AudioCall "list" request (it works without
+  /// registering), then the session is destroyed.
+  Future<List<FoundServer>> _probeSeed(String host, int port) async {
+    final socket = await WebSocket.connect(
+      'ws://$host:$port',
+      protocols: ['janus-protocol'],
+    ).timeout(const Duration(seconds: 5));
+    final waiting = <String, Completer<Map<String, dynamic>>>{};
+    final listResult = Completer<Map<String, dynamic>>();
+    final subscription = socket.listen(
+      (dynamic data) {
+        if (data is! String) return;
+        Map<String, dynamic> m;
+        try {
+          m = jsonDecode(data) as Map<String, dynamic>;
+        } catch (_) {
+          return;
+        }
+        final type = m['janus'];
+        if (type == 'event') {
+          final pluginData = m['plugindata'];
+          final pdata = pluginData is Map ? pluginData['data'] : null;
+          final result = pdata is Map ? pdata['result'] : null;
+          if (result is Map && result['list'] is List && !listResult.isCompleted) {
+            listResult.complete(Map<String, dynamic>.from(result));
+          }
+          return;
+        }
+        final transaction = m['transaction'] as String?;
+        if (transaction != null && (type == 'success' || type == 'error')) {
+          final completer = waiting.remove(transaction);
+          if (completer != null && !completer.isCompleted) completer.complete(m);
+        }
+      },
+      onError: (Object error) => print('SEED $host:$port WebSocket error: $error'),
+      cancelOnError: false,
+    );
+
+    Future<Map<String, dynamic>> send(Map<String, dynamic> message) async {
+      final transaction = _newTransaction();
+      final completer = Completer<Map<String, dynamic>>();
+      waiting[transaction] = completer;
+      socket.add(jsonEncode({...message, 'transaction': transaction}));
+      final reply = await completer.future.timeout(const Duration(seconds: 5));
+      if (reply['janus'] != 'success') {
+        throw Exception('seed $host:$port refused "${message['janus']}": ${reply['error']}');
+      }
+      return reply;
+    }
+
+    int? sessionId;
+    try {
+      final created = await send({'janus': 'create'});
+      sessionId = (created['data'] as Map)['id'] as int;
+      final attached = await send({
+        'janus': 'attach',
+        'plugin': kAudioPlugin,
+        'session_id': sessionId,
+      });
+      final handleId = (attached['data'] as Map)['id'] as int;
+      socket.add(jsonEncode({
+        'janus': 'message',
+        'body': {'request': 'list'},
+        'session_id': sessionId,
+        'handle_id': handleId,
+        'transaction': _newTransaction(),
+      }));
+      final result = await listResult.future.timeout(const Duration(seconds: 5));
+      final servers = _serversFromList(result, host, port);
+      print('SEED $host:$port: ${servers.map((s) => '${s.name}@${s.host}=${s.users}').join(', ')}');
+      return servers;
+    } finally {
+      if (sessionId != null) {
+        try {
+          socket.add(jsonEncode({
+            'janus': 'destroy',
+            'session_id': sessionId,
+            'transaction': _newTransaction(),
+          }));
+        } catch (_) {}
+      }
+      await subscription.cancel();
+      try {
+        await socket.close();
+      } catch (_) {}
+    }
+  }
+
+  /// The servers in a "list" result: the server that answered (reached at its
+  /// public_host, or at the seed address) and every server it knows (reached at
+  /// their public_host, or their LAN address if they have none).
+  List<FoundServer> _serversFromList(
+    Map<String, dynamic> r,
+    String seedHost,
+    int seedPort,
+  ) {
+    int count(dynamic users) => users is List ? users.length : 0;
+    final servers = <FoundServer>[];
+    final self = r['server']?.toString();
+    if (self != null) {
+      servers.add(FoundServer(
+        self,
+        (r['public_host'] ?? seedHost).toString(),
+        (r['ws_port'] as num?)?.toInt() ?? seedPort,
+        count(r['list']),
+      ));
+    }
+    if (r['servers'] is List) {
+      for (final s in r['servers'] as List) {
+        if (s is! Map || s['server'] == null) continue;
+        final host = (s['public_host'] ?? s['ip'])?.toString();
+        if (host == null || host.isEmpty || host == '?') continue;
+        servers.add(FoundServer(
+          s['server'].toString(),
+          host,
+          (s['ws_port'] as num?)?.toInt() ?? 8188,
+          count(s['users']),
+        ));
+      }
+    }
+    return servers;
+  }
+
+  /// All the servers we can find: from the seed servers (internet) and the
+  /// LAN broadcast, at the same time. A server found on the LAN keeps its LAN
+  /// address (always reachable from here); the others use their public_host.
+  Future<List<FoundServer>> _findServers() async {
+    final seeds = parseSeeds();
+    final results = await Future.wait<List<FoundServer>>([
+      for (final (host, port) in seeds)
+        _probeSeed(host, port).catchError((Object error) {
+          print('SEED $host:$port failed: $error');
+          return <FoundServer>[];
+        }),
+      _discoverLan().catchError((Object error) {
+        print('DISCOVER LAN failed: $error');
+        return <FoundServer>[];
+      }),
+    ]);
+    final found = <String, FoundServer>{};
+    for (final list in results) {
+      for (final server in list) {
+        found[server.name] = server; // the LAN answers come last and win
+      }
+    }
     return found.values.toList();
   }
 
@@ -546,7 +713,7 @@ class _CallPageState extends State<CallPage> {
       _videoAvailable = false;
       _registeredAs = null;
       _phase = CallPhase.idle;
-      _status = 'Looking for Janus servers on the network...';
+      _status = 'Looking for Janus servers...';
     });
 
     try {
@@ -556,9 +723,13 @@ class _CallPageState extends State<CallPage> {
       _audioHandleId = null;
       _videoHandleId = null;
 
-      final servers = await _discoverServers();
+      final servers = await _findServers();
       if (servers.isEmpty) {
-        throw Exception('no Janus server answered on the network');
+        final seeds = parseSeeds();
+        throw Exception(seeds.isEmpty
+            ? 'no Janus server answered on the LAN (no IC_SEEDS set)'
+            : 'no Janus server answered (LAN, or seeds '
+                '${seeds.map((s) => '${s.$1}:${s.$2}').join(', ')})');
       }
       final pick = _pickServer(servers);
       _serversSummary = servers
