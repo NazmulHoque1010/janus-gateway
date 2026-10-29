@@ -4649,7 +4649,7 @@ static void *janus_sip_handler(void *data) {
 
 send_invite:
 			/* Prepare the From header */
-			char from_hdr[1024];
+			; char from_hdr[1024];
 			char *local_tag = g_malloc0(7);
 			janus_sip_random_string(7, local_tag);
 			/* Prepare the stack */
