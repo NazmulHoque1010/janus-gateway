@@ -1,0 +1,52 @@
+Placeholders written by "install-ic-server.sh --export".
+__IC_LOCAL_IP__  = the private IP of the server being installed
+__IC_PUBLIC_IP__ = its public IP (its private IP on a LAN-only server)
+Passwords (asked for at install time, or given with --secrets FILE as NAME=value):
+  AUTH_PASS   in freeswitch/conf/autoload_configs/xml_rpc.conf.xml
+  CHANGE_PASS_KEY   in freeswitch/conf/autoload_configs/voicemail.conf.xml
+  DB_PASSWORD   in freeswitch/xml-service/index.php
+  DEFAULT_PROVIDER_PASSWORD   in freeswitch/conf/autoload_configs/easyroute.conf.xml, freeswitch/conf/autoload_configs/smpp.conf.xml, freeswitch/conf/vars.xml, freeswitch/conf/vars.xml.bak_port
+  PASS   in freeswitch/conf/autoload_configs/dialplan_directory.conf.xml
+  PASSWORD   in freeswitch/conf/autoload_configs/amqp.conf.xml
+  PASSWORD_2   in freeswitch/conf/autoload_configs/hiredis.conf.xml
+  PASSWORD_MASK   in freeswitch/conf/autoload_configs/voicemail_ivr.conf.xml
+  SECRET_KEY   in freeswitch/conf/autoload_configs/sms_flowroute.conf.xml
+  SIP_PASSWORD   in freeswitch/conf/autoload_configs/event_socket.conf.xml, freeswitch/conf/vars.xml, freeswitch/conf/vars.xml.bak_port, freeswitch/xml-service/index.php
+  VM_PASSWORD   in freeswitch/conf/directory/default/1001.xml, freeswitch/conf/directory/default_backup/1001.xml
+  VM_PASSWORD_10   in freeswitch/conf/directory/default/1019.xml, freeswitch/conf/directory/default_backup/1019.xml
+  VM_PASSWORD_11   in freeswitch/conf/directory/default/1014.xml, freeswitch/conf/directory/default_backup/1014.xml
+  VM_PASSWORD_12   in freeswitch/conf/directory/default/1008.xml, freeswitch/conf/directory/default_backup/1008.xml
+  VM_PASSWORD_13   in freeswitch/conf/directory/default/1013.xml, freeswitch/conf/directory/default_backup/1013.xml
+  VM_PASSWORD_14   in freeswitch/conf/directory/default/1010.xml, freeswitch/conf/directory/default_backup/1010.xml
+  VM_PASSWORD_15   in freeswitch/conf/directory/default/1009.xml, freeswitch/conf/directory/default_backup/1009.xml
+  VM_PASSWORD_16   in freeswitch/conf/directory/default/1005.xml, freeswitch/conf/directory/default_backup/1005.xml
+  VM_PASSWORD_17   in freeswitch/conf/directory/default/1018.xml, freeswitch/conf/directory/default_backup/1018.xml
+  VM_PASSWORD_18   in freeswitch/conf/directory/default/1016.xml, freeswitch/conf/directory/default_backup/1016.xml
+  VM_PASSWORD_19   in freeswitch/conf/directory/default/1011.xml, freeswitch/conf/directory/default_backup/1011.xml
+  VM_PASSWORD_2   in freeswitch/conf/directory/default/1017.xml, freeswitch/conf/directory/default_backup/1017.xml
+  VM_PASSWORD_20   in freeswitch/conf/directory/default/1000.xml, freeswitch/conf/directory/default_backup/1000.xml
+  VM_PASSWORD_21   in freeswitch/conf/directory/default/brian.xml, freeswitch/conf/directory/default_backup/brian.xml
+  VM_PASSWORD_3   in freeswitch/conf/directory/default/1002.xml, freeswitch/conf/directory/default_backup/1002.xml
+  VM_PASSWORD_4   in freeswitch/conf/directory/default/1012.xml, freeswitch/conf/directory/default_backup/1012.xml
+  VM_PASSWORD_5   in freeswitch/conf/directory/default/1006.xml, freeswitch/conf/directory/default_backup/1006.xml
+  VM_PASSWORD_6   in freeswitch/conf/directory/default/1003.xml, freeswitch/conf/directory/default_backup/1003.xml
+  VM_PASSWORD_7   in freeswitch/conf/directory/default/1007.xml, freeswitch/conf/directory/default_backup/1007.xml
+  VM_PASSWORD_8   in freeswitch/conf/directory/default/1015.xml, freeswitch/conf/directory/default_backup/1015.xml
+  VM_PASSWORD_9   in freeswitch/conf/directory/default/1004.xml, freeswitch/conf/directory/default_backup/1004.xml
+
+Other private IPs left as they are (other servers, e.g. a shared MySQL).
+Check that they are right for a new server:
+  10.0.0.1   in janus/janus.jcfg
+  10.0.0.10   in freeswitch/conf/autoload_configs/hash.conf.xml
+  10.0.1.251   in freeswitch/conf/sip_profiles/internal-ipv6.xml, freeswitch/conf/sip_profiles/internal.xml
+  172.18.101.101   in freeswitch/conf/autoload_configs/hiredis.conf.xml
+  192.168.0.0   in freeswitch/conf/autoload_configs/acl.conf.xml
+  192.168.0.1   in janus/janus.jcfg, janus/janus.transport.http.jcfg, janus/janus.transport.websockets.jcfg
+  192.168.0.69   in freeswitch/conf/autoload_configs/graylog2.conf.xml
+  192.168.1.1   in freeswitch/conf/autoload_configs/easyroute.conf.xml, freeswitch/conf/autoload_configs/sangoma_codec.conf.xml
+  192.168.1.100   in freeswitch/conf/autoload_configs/sangoma_codec.conf.xml
+  192.168.1.200   in freeswitch/conf/autoload_configs/oreka.conf.xml
+  192.168.42.0   in freeswitch/conf/autoload_configs/acl.conf.xml
+  192.168.42.42   in freeswitch/conf/autoload_configs/acl.conf.xml
+  192.168.66.6   in freeswitch/conf/autoload_configs/easyroute.conf.xml
+  192.168.99.112   in freeswitch/conf/autoload_configs/acl.conf.xml, freeswitch/conf/sip_profiles/external/pc2.xml, freeswitch/scripts/billed_bridge.lua

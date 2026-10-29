@@ -1,0 +1,4 @@
+captured: 2026-10-29 15:16:44 on Lenovo (nazmul)
+freeswitch: source
+freeswitch version: FreeSWITCH version: 1.10.12-release+git~20240802T210227Z~a88d069d6f~64bit (git a88d069 2024-08-02 21:02:27Z 64bit)
+janus: Janus version: 1403 (1.4.3) Janus commit: d40b499c0543aea73bd05a6741d742a174f55294 

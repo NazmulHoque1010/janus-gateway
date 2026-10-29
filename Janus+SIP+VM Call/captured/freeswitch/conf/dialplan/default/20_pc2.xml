@@ -1,0 +1,7 @@
+<include>
+  <extension name="to_pc2_1001">
+    <condition field="destination_number" expression="^1001$">
+      <action application="bridge" data="sofia/gateway/pc2/1001"/>
+    </condition>
+  </extension>
+</include>
