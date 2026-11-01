@@ -1,0 +1,21 @@
+[Unit]
+Description=AudioCall media relay (learning UDP forwarder)
+Documentation=https://claude.ai/code/session_019DjGiNBsLVRf1mWBGdio6H
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs under a throwaway unprivileged system user (no account to create).
+DynamicUser=yes
+ExecStart=/usr/bin/python3 /opt/media-relay/media_relay.py --port 7090
+Restart=always
+RestartSec=2
+# Modest hardening — the relay only needs the network.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

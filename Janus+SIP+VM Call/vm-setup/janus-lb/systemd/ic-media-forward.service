@@ -1,0 +1,13 @@
+[Unit]
+Description=IC: forward FreeSWITCH media between VM1 and VM2 (janus-lb)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/ic-media-forward.sh
+ExecStop=/sbin/iptables -D FORWARD -j IC_FWD
+
+[Install]
+WantedBy=multi-user.target
