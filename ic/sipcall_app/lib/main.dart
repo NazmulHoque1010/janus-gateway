@@ -2,9 +2,14 @@
 //
 // Audio and video calls through the IC servers: each VM runs Janus (WebRTC)
 // and FreeSWITCH (SIP). The app talks only to Janus, over the Janus WebSocket
-// API, using the stock janus.plugin.sip plugin; Janus registers the user with
-// the FreeSWITCH on the same VM. Calls between users on different VMs are
-// connected by FreeSWITCH, with their media relayed through janus-lb.
+// API, and registers its name twice on the server it joins:
+//   * janus.plugin.videocall - calls between app users. Janus connects the two
+//     apps directly; FreeSWITCH is not involved and nothing is transcoded.
+//   * janus.plugin.sip       - calls with SIP phones (e.g. MizuDroid). Janus
+//     registers the name with the FreeSWITCH on the same VM, which converts
+//     between the app's Opus and the phone's PCMU. Calls to phones are audio only.
+// The status service says which online users are SIP phones; every other name
+// is called through the VideoCall plugin (same server only).
 //
 // First start: the app asks for a name and remembers it. Every start after
 // that it registers that name automatically, until "Disconnect & rename".
@@ -44,6 +49,7 @@ const String kSeeds = String.fromEnvironment('IC_SEEDS');
 const int kStatusPort = int.fromEnvironment('IC_STATUS_PORT', defaultValue: 8190);
 
 const String kSipPlugin = 'janus.plugin.sip';
+const String kVideoCallPlugin = 'janus.plugin.videocall';
 const String kPassword = '1234';
 const String kDefaultDomain = 'ic.local';
 const String kPrefsName = 'ic_sip_username';
@@ -75,6 +81,7 @@ class ServerInfo {
     required this.sipProxy,
     required this.domain,
     required this.users,
+    required this.phones,
     required this.load,
     required this.online,
     required this.sipOk,
@@ -85,7 +92,8 @@ class ServerInfo {
   final int wsPort; // Janus WebSocket port
   final String sipProxy; // where Janus reaches FreeSWITCH (sip:127.0.0.1:5060)
   final String domain; // SIP domain (ic.local)
-  final List<String> users;
+  final List<String> users; // everyone online here (app users and SIP phones)
+  final List<String> phones; // the users that are SIP phones (e.g. MizuDroid)
   final int? load;
   final bool online;
   final bool sipOk;
@@ -106,6 +114,9 @@ class ServerInfo {
       users: j['users'] is List
           ? (j['users'] as List).map((e) => e.toString()).toList()
           : <String>[],
+      phones: j['phones'] is List
+          ? (j['phones'] as List).map((e) => e.toString()).toList()
+          : <String>[],
       load: (j['load'] as num?)?.toInt(),
       online: j['online'] == true,
       sipOk: j['sip_ok'] == true,
@@ -114,6 +125,12 @@ class ServerInfo {
 }
 
 enum CallKind { audio, video }
+
+/// Which Janus plugin carries the current call.
+enum CallPath {
+  videocall, // app <-> app, Janus only
+  sip, // app <-> SIP phone, through FreeSWITCH
+}
 
 enum CallPhase {
   idle, // no call
@@ -177,9 +194,11 @@ class _CallPageState extends State<CallPage> {
   String? _registeredAs;
   Completer<void>? _registration;
   Completer<void>? _unregistration;
+  Completer<void>? _vcRegistration;
 
   CallPhase _phase = CallPhase.idle;
   CallKind _callKind = CallKind.audio;
+  CallPath _callPath = CallPath.videocall;
   String _peerName = '';
 
   DateTime? _callStartedAt;
@@ -201,6 +220,7 @@ class _CallPageState extends State<CallPage> {
 
   int? _sessionId;
   int? _sipHandleId;
+  int? _vcHandleId; // VideoCall plugin handle
   WebSocket? _socket;
   StreamSubscription<dynamic>? _socketSub;
   Timer? _keepAliveTimer;
@@ -231,6 +251,17 @@ class _CallPageState extends State<CallPage> {
       : (Platform.isLinux ? 'Linux' : Platform.operatingSystem);
 
   String _kindName(CallKind kind) => kind == CallKind.audio ? 'audio' : 'video';
+
+  /// Is this online user a SIP phone (called through FreeSWITCH)?
+  bool _isPhone(String user) => _servers.any((s) => s.phones.contains(user));
+
+  /// The Janus handle that carries calls on [path].
+  int? _handleFor(CallPath path) =>
+      path == CallPath.sip ? _sipHandleId : _vcHandleId;
+
+  /// A call (or ringing) is in progress on the other plugin than [path].
+  bool _busyOnOtherPath(CallPath path) =>
+      _phase != CallPhase.idle && _callPath != path;
 
   @override
   void initState() {
@@ -501,6 +532,10 @@ class _CallPageState extends State<CallPage> {
     if (registration != null && !registration.isCompleted) {
       registration.completeError(Exception(reason));
     }
+    final vcRegistration = _vcRegistration;
+    if (vcRegistration != null && !vcRegistration.isCompleted) {
+      vcRegistration.completeError(Exception(reason));
+    }
 
     _closeIncomingDialog();
     unawaited(_disposeWebRtc());
@@ -512,6 +547,7 @@ class _CallPageState extends State<CallPage> {
       _registeredAs = null;
       _sessionId = null;
       _sipHandleId = null;
+      _vcHandleId = null;
       _phase = CallPhase.idle;
       _status = '$reason Reconnecting...';
     });
@@ -629,6 +665,34 @@ class _CallPageState extends State<CallPage> {
     );
   }
 
+  /// Sends a request to the VideoCall plugin handle (optionally with an SDP).
+  Future<void> _vcRequest(
+    Map<String, dynamic> body, {
+    Map<String, dynamic>? jsep,
+  }) async {
+    final handleId = _vcHandleId;
+    if (handleId == null) throw Exception('VideoCall plugin not attached');
+    await _request(
+      {
+        'janus': 'message',
+        'body': body,
+        'jsep': ?jsep,
+      },
+      handleId: handleId,
+      timeout: const Duration(seconds: 15),
+    );
+  }
+
+  /// Sends a call request (call / accept / hangup / decline) on [path].
+  Future<void> _pathRequest(
+    CallPath path,
+    Map<String, dynamic> body, {
+    Map<String, dynamic>? jsep,
+  }) =>
+      path == CallPath.sip
+          ? _sipRequest(body, jsep: jsep)
+          : _vcRequest(body, jsep: jsep);
+
   void _startKeepAlive() {
     _keepAliveTimer?.cancel();
     _keepAliveTimer = Timer.periodic(const Duration(seconds: 25), (_) {
@@ -669,6 +733,7 @@ class _CallPageState extends State<CallPage> {
       await _closeWebSocket();
       _sessionId = null;
       _sipHandleId = null;
+      _vcHandleId = null;
 
       final servers = await _findServers();
       final pick = _pickServer(servers, name);
@@ -711,6 +776,21 @@ class _CallPageState extends State<CallPage> {
         _registration = null;
       }
 
+      // Same name in the VideoCall plugin, for calls between app users
+      final vcAttached =
+          await _request({'janus': 'attach', 'plugin': kVideoCallPlugin});
+      _vcHandleId = (vcAttached['data'] as Map)['id'] as int;
+      _setStatus('Registering $name for app-to-app calls on ${pick.name}...');
+      final vcRegistration = Completer<void>();
+      vcRegistration.future.ignore();
+      _vcRegistration = vcRegistration;
+      try {
+        await _vcRequest({'request': 'register', 'username': name});
+        await vcRegistration.future.timeout(const Duration(seconds: 10));
+      } finally {
+        _vcRegistration = null;
+      }
+
       if (!mounted) return;
       setState(() {
         _isRegistered = true;
@@ -725,6 +805,7 @@ class _CallPageState extends State<CallPage> {
       await _closeWebSocket();
       _sessionId = null;
       _sipHandleId = null;
+      _vcHandleId = null;
       _scheduleReconnect(5);
     } finally {
       if (mounted) setState(() => _isRegistering = false);
@@ -792,6 +873,7 @@ class _CallPageState extends State<CallPage> {
       _savedName = null;
       _sessionId = null;
       _sipHandleId = null;
+      _vcHandleId = null;
       _server = null;
       _servers = [];
       _serversSummary = '';
@@ -857,7 +939,9 @@ class _CallPageState extends State<CallPage> {
     if (type != 'event') return;
 
     final sender = message['sender'];
-    if (sender is! num || sender.toInt() != _sipHandleId) return;
+    if (sender is! num) return;
+    final senderId = sender.toInt();
+    if (senderId != _sipHandleId && senderId != _vcHandleId) return;
 
     final pluginData = message['plugindata'];
     if (pluginData is! Map) return;
@@ -866,6 +950,11 @@ class _CallPageState extends State<CallPage> {
 
     final jsepRaw = message['jsep'];
     final jsep = jsepRaw is Map ? Map<String, dynamic>.from(jsepRaw) : null;
+
+    if (senderId == _vcHandleId) {
+      await _handleVideoCallEvent(Map<String, dynamic>.from(data), jsep);
+      return;
+    }
 
     // Plugin errors (bad request, wrong state, ...)
     if (data['error'] != null) {
@@ -876,9 +965,10 @@ class _CallPageState extends State<CallPage> {
         registration.completeError(Exception(text));
         return;
       }
-      // A call that is still being set up fails; a running call is left alone
-      // (e.g. the error came from refusing a second incoming call).
-      if (_phase == CallPhase.calling || _phase == CallPhase.connecting) {
+      // A SIP call that is still being set up fails; anything else is left
+      // alone (e.g. the error came from refusing a second incoming call).
+      if (_callPath == CallPath.sip &&
+          (_phase == CallPhase.calling || _phase == CallPhase.connecting)) {
         await _endCall(text);
       } else {
         _setStatus(text);
@@ -891,6 +981,16 @@ class _CallPageState extends State<CallPage> {
     final r = Map<String, dynamic>.from(result);
     final event = r['event'] as String?;
     print('DEBUG: sip event: $event');
+
+    // While an app-to-app (VideoCall) call is going on, SIP call events can
+    // only belong to a phone call we are refusing: they must not touch it.
+    final sipCallEvents = {
+      'calling', 'ringing', 'progress', 'accepted', 'updatingcall', 'hangup',
+    };
+    if (sipCallEvents.contains(event) && _busyOnOtherPath(CallPath.sip)) {
+      print('DEBUG: ignoring SIP $event during a ${_callPath.name} call');
+      return;
+    }
 
     switch (event) {
       case 'registering':
@@ -952,7 +1052,7 @@ class _CallPageState extends State<CallPage> {
 
       case 'incomingcall':
         final caller = _userFromUri(r['username']?.toString());
-        unawaited(_handleIncomingCall(caller, jsep));
+        unawaited(_handleIncomingCall(caller, jsep, CallPath.sip));
         return;
 
       case 'updatingcall':
@@ -970,6 +1070,114 @@ class _CallPageState extends State<CallPage> {
 
       default:
         return; // 'proceeding', 'info', 'message', 'notify', ...
+    }
+  }
+
+  /// Events of the VideoCall plugin (calls between app users).
+  Future<void> _handleVideoCallEvent(
+    Map<String, dynamic> data,
+    Map<String, dynamic>? jsep,
+  ) async {
+    if (data['error'] != null) {
+      final code = (data['error_code'] as num?)?.toInt();
+      final text = 'VideoCall error ${code ?? ''}: ${data['error']}';
+      print('PLUGIN ERROR: $text');
+      final registration = _vcRegistration;
+      if (registration != null && !registration.isCompleted) {
+        registration.completeError(Exception(code == 476
+            ? 'the name is still held by a previous session, waiting for it to end'
+            : text));
+        return;
+      }
+      if (_callPath == CallPath.videocall &&
+          (_phase == CallPhase.calling || _phase == CallPhase.connecting)) {
+        // 478: no such username (not an app user on this server)
+        await _endCall(code == 478 ? '$_peerName is not online on this server.' : text);
+      } else {
+        _setStatus(text);
+      }
+      return;
+    }
+
+    final result = data['result'];
+    if (result is! Map) return;
+    final r = Map<String, dynamic>.from(result);
+    final event = r['event'] as String?;
+    print('DEBUG: videocall event: $event');
+
+    // While a phone (SIP) call is going on, VideoCall call events can only
+    // belong to an app call we are refusing: they must not touch it.
+    if (event != 'registered' && event != 'incomingcall' &&
+        _busyOnOtherPath(CallPath.videocall)) {
+      print('DEBUG: ignoring VideoCall $event during a ${_callPath.name} call');
+      return;
+    }
+
+    switch (event) {
+      case 'registered':
+        final pending = _vcRegistration;
+        if (pending != null && !pending.isCompleted) pending.complete();
+        return;
+
+      case 'calling':
+        if (_phase == CallPhase.calling) _setStatus('Ringing $_peerName...');
+        return;
+
+      case 'incomingcall':
+        final caller = (r['username'] ?? 'unknown').toString();
+        unawaited(_handleIncomingCall(caller, jsep, CallPath.videocall));
+        return;
+
+      case 'accepted':
+        // Caller side: carries the callee's answer. Callee side: no SDP.
+        if (_phase == CallPhase.calling) {
+          if (jsep != null) await _applyRemoteAnswer(jsep);
+          if (mounted) setState(() => _phase = CallPhase.connecting);
+          _setStatus('$_peerName answered. Connecting...');
+        }
+        return;
+
+      case 'update':
+        // Renegotiation: answer a new offer with "set"
+        final pc = _peerConnection;
+        if (pc != null && jsep != null && jsep['type'] == 'offer') {
+          try {
+            await pc.setRemoteDescription(
+              RTCSessionDescription(jsep['sdp'] as String?, 'offer'),
+            );
+            final answer = await pc.createAnswer({});
+            await pc.setLocalDescription(answer);
+            await _vcRequest({'request': 'set'},
+                jsep: {'type': answer.type, 'sdp': answer.sdp});
+          } catch (error) {
+            print('VIDEOCALL UPDATE ERROR: $error');
+          }
+        } else if (pc != null && jsep != null && jsep['type'] == 'answer') {
+          await pc.setRemoteDescription(
+            RTCSessionDescription(jsep['sdp'] as String?, 'answer'),
+          );
+        }
+        return;
+
+      case 'hangup':
+        final reason = (r['reason'] ?? '').toString();
+        if (_phase == CallPhase.ringing) {
+          // The caller gave up while our Accept/Decline dialog was open
+          _incomingCancelledByCaller = true;
+          _closeIncomingDialog();
+          return;
+        }
+        if (_phase == CallPhase.idle) return; // confirmation of our own hangup
+        final busy = reason.toLowerCase().contains('busy');
+        await _endCall(busy
+            ? '$_peerName is busy.'
+            : _phase == CallPhase.calling
+                ? '$_peerName did not take the call.'
+                : 'Call with $_peerName ended.');
+        return;
+
+      default:
+        return; // 'simulcast', 'set', ...
     }
   }
 
@@ -1015,9 +1223,12 @@ class _CallPageState extends State<CallPage> {
   // WebRTC
   // ---------------------------------------------------------------------------
 
-  Future<RTCPeerConnection> _createMediaAndPeerConnection(CallKind kind) async {
+  Future<RTCPeerConnection> _createMediaAndPeerConnection(
+    CallKind kind,
+    CallPath path,
+  ) async {
     await _disposeWebRtc();
-    final handleId = _sipHandleId;
+    final handleId = _handleFor(path); // trickle goes to the plugin of this call
 
     // Audio calls never touch the camera
     final stream = await navigator.mediaDevices.getUserMedia({
@@ -1243,7 +1454,7 @@ class _CallPageState extends State<CallPage> {
   // Outgoing call
   // ---------------------------------------------------------------------------
 
-  Future<void> _startCall(String destination, CallKind kind) async {
+  Future<void> _startCall(String destination, CallKind requestedKind) async {
     final target = destination.trim().toLowerCase();
     if (!_isRegistered) {
       _setStatus('Not registered yet.');
@@ -1259,8 +1470,17 @@ class _CallPageState extends State<CallPage> {
     }
     if (_phase != CallPhase.idle) return;
 
+    // SIP phones are called through FreeSWITCH (audio only); app users
+    // directly through Janus's VideoCall plugin
+    final path = _isPhone(target) ? CallPath.sip : CallPath.videocall;
+    final kind = path == CallPath.sip ? CallKind.audio : requestedKind;
+    if (kind != requestedKind) {
+      print('DEBUG: $target is a SIP phone, calling with audio only');
+    }
+
     setState(() {
       _callKind = kind;
+      _callPath = path;
       _phase = CallPhase.calling;
       _peerName = target;
       _isMuted = false;
@@ -1272,16 +1492,21 @@ class _CallPageState extends State<CallPage> {
     });
 
     try {
-      final pc = await _createMediaAndPeerConnection(kind);
+      final pc = await _createMediaAndPeerConnection(kind, path);
       final offer = await pc.createOffer({
         'offerToReceiveAudio': 1,
         'offerToReceiveVideo': kind == CallKind.video ? 1 : 0,
       });
       await pc.setLocalDescription(offer);
 
-      _setStatus('Calling $target (${_kindName(kind)})...');
-      await _sipRequest(
-        {'request': 'call', 'uri': 'sip:$target@$_domain'},
+      _setStatus(path == CallPath.sip
+          ? 'Calling phone $target (audio, via FreeSWITCH)...'
+          : 'Calling $target (${_kindName(kind)})...');
+      await _pathRequest(
+        path,
+        path == CallPath.sip
+            ? {'request': 'call', 'uri': 'sip:$target@$_domain'}
+            : {'request': 'call', 'username': target},
         jsep: {'type': offer.type, 'sdp': offer.sdp},
       );
     } catch (error) {
@@ -1303,20 +1528,25 @@ class _CallPageState extends State<CallPage> {
     return false;
   }
 
-  Future<void> _handleIncomingCall(String caller, Map<String, dynamic>? jsep) async {
+  Future<void> _handleIncomingCall(
+    String caller,
+    Map<String, dynamic>? jsep,
+    CallPath path,
+  ) async {
     if (_phase != CallPhase.idle) {
-      await _decline(486); // Busy Here
+      await _refuse(path, 486); // Busy Here
       return;
     }
     if (jsep == null) {
       _setStatus('Incoming call from $caller had no SDP offer.');
-      await _decline(488);
+      await _refuse(path, 488);
       return;
     }
     final kind = _offerHasVideo(jsep['sdp'] as String?) ? CallKind.video : CallKind.audio;
 
     setState(() {
       _callKind = kind;
+      _callPath = path;
       _phase = CallPhase.ringing;
       _peerName = caller;
       _isMuted = false;
@@ -1339,7 +1569,7 @@ class _CallPageState extends State<CallPage> {
 
     if (!accept) {
       if (mounted) setState(() => _phase = CallPhase.idle);
-      await _decline(603); // Decline
+      await _refuse(path, 603); // Decline
       _setStatus('Declined the call from $caller.');
       return;
     }
@@ -1349,7 +1579,7 @@ class _CallPageState extends State<CallPage> {
         _phase = CallPhase.connecting;
         _status = 'Answering $caller...';
       });
-      final pc = await _createMediaAndPeerConnection(kind);
+      final pc = await _createMediaAndPeerConnection(kind, path);
       await pc.setRemoteDescription(
         RTCSessionDescription(jsep['sdp'] as String?, jsep['type'] as String?),
       );
@@ -1358,14 +1588,15 @@ class _CallPageState extends State<CallPage> {
         'offerToReceiveVideo': kind == CallKind.video ? 1 : 0,
       });
       await pc.setLocalDescription(answer);
-      await _sipRequest(
+      await _pathRequest(
+        path,
         {'request': 'accept'},
         jsep: {'type': answer.type, 'sdp': answer.sdp},
       );
       _setStatus('Answered. Connecting with $caller...');
     } catch (error) {
       print('ACCEPT ERROR: $error');
-      await _decline(500);
+      await _refuse(path, 500);
       await _endCall('Could not answer: $error');
     }
   }
@@ -1412,13 +1643,18 @@ class _CallPageState extends State<CallPage> {
   // Hang up
   // ---------------------------------------------------------------------------
 
-  /// Refuses an incoming call with a SIP code (486 busy, 603 declined, ...).
-  Future<void> _decline(int code) async {
-    if (_socket == null || _sipHandleId == null) return;
+  /// Refuses an incoming call: SIP with a code (486 busy, 603 declined, ...),
+  /// VideoCall with a hangup (the plugin has no codes).
+  Future<void> _refuse(CallPath path, int code) async {
+    if (_socket == null || _handleFor(path) == null) return;
     try {
-      await _sipRequest({'request': 'decline', 'code': code});
+      if (path == CallPath.sip) {
+        await _sipRequest({'request': 'decline', 'code': code});
+      } else {
+        await _vcRequest({'request': 'hangup'});
+      }
     } catch (error) {
-      print('DECLINE ERROR: $error');
+      print('REFUSE ERROR: $error');
     }
   }
 
@@ -1426,10 +1662,11 @@ class _CallPageState extends State<CallPage> {
   Future<void> _hangup() async {
     if (_phase == CallPhase.idle) return;
     final peer = _peerName;
+    final path = _callPath;
     await _endCall('Call with $peer ended.');
-    if (_socket == null || _sipHandleId == null) return;
+    if (_socket == null || _handleFor(path) == null) return;
     try {
-      await _sipRequest({'request': 'hangup'});
+      await _pathRequest(path, {'request': 'hangup'});
     } catch (error) {
       print('HANGUP ERROR: $error');
     }
@@ -1608,10 +1845,13 @@ class _CallPageState extends State<CallPage> {
                   ListTile(
                     dense: true,
                     contentPadding: const EdgeInsets.only(left: 8),
-                    leading: Icon(server.name == _server?.name
-                        ? Icons.person
-                        : Icons.public),
+                    leading: Icon(server.phones.contains(user)
+                        ? Icons.phone_android
+                        : (server.name == _server?.name ? Icons.person : Icons.public)),
                     title: Text(user),
+                    subtitle: Text(server.phones.contains(user)
+                        ? 'SIP phone (audio only)'
+                        : 'app'),
                     trailing: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
@@ -1622,7 +1862,9 @@ class _CallPageState extends State<CallPage> {
                         ),
                         IconButton(
                           tooltip: 'Video call',
-                          onPressed: idle ? () => _startCall(user, CallKind.video) : null,
+                          onPressed: idle && !server.phones.contains(user)
+                              ? () => _startCall(user, CallKind.video)
+                              : null,
                           icon: const Icon(Icons.videocam),
                         ),
                       ],
@@ -1824,9 +2066,11 @@ class _CallPageState extends State<CallPage> {
               'Server: ${_server?.name ?? '-'}   Janus: $_janusWsUrl '
               '(${_socket != null ? 'connected' : 'disconnected'})\n'
               'Servers: ${_serversSummary.isEmpty ? '-' : _serversSummary}\n'
-              'Session: ${_sessionId ?? '-'}   SIP handle: ${_sipHandleId ?? '-'}\n'
-              'Registered: ${_registeredAs == null ? 'no' : 'sip:$_registeredAs@$_domain'}\n'
-              'Call: ${_phase.name}${_phase == CallPhase.idle ? '' : ' (${_kindName(_callKind)})'}',
+              'Session: ${_sessionId ?? '-'}   SIP handle: ${_sipHandleId ?? '-'}   '
+              'VideoCall handle: ${_vcHandleId ?? '-'}\n'
+              'Registered: ${_registeredAs == null ? 'no' : 'sip:$_registeredAs@$_domain + VideoCall $_registeredAs'}\n'
+              'Call: ${_phase.name}${_phase == CallPhase.idle ? '' : ' (${_kindName(_callKind)}, '
+                  '${_callPath == CallPath.sip ? 'SIP via FreeSWITCH' : 'VideoCall, Janus only'})'}',
               style: const TextStyle(fontSize: 12),
             ),
           ],
